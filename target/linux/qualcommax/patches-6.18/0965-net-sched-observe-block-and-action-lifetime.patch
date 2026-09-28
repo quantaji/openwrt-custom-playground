@@ -1,0 +1,546 @@
+From: Codex
+Subject: [PATCH] net: sched: observe committed block and action lifetime
+
+Expose mutation completion separately from counted execution callbacks.
+Replay only a real bound callback and carry actual action/old-rule identity.
+Identity-only removal does not depend on successful action translation.
+Include the approved complete matchall class result in typed offers.
+
+Signed-off-by: Codex
+---
+diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
+index 596ab97..ee63a7b 100644
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@ -237,6 +237,8 @@ struct flow_action_entry {
+ 	unsigned long			cookie;
+ 	u64				miss_cookie;
+ 	enum flow_action_hw_stats	hw_stats;
++	int				control_action;
++	u32				action_flags;
+ 	action_destr			destructor;
+ 	void				*destructor_priv;
+ 	union {
+@@ -592,6 +594,7 @@ struct flow_block_offload {
+ 	bool unlocked_driver_cb;
+ 	struct net *net;
+ 	struct flow_block *block;
++	struct tcf_block *native_block; /* Borrowed for this bind/unbind call. */
+ 	struct list_head cb_list;
+ 	struct list_head *driver_block_list;
+ 	struct netlink_ext_ack *extack;
+@@ -694,6 +697,7 @@ struct flow_cls_offload {
+ 	enum flow_cls_command command;
+ 	bool use_act_stats;
+ 	unsigned long cookie;
++	unsigned long replace_cookie;
+ 	struct flow_rule *rule;
+ 	struct flow_stats stats;
+ 	u32 classid;
+@@ -703,6 +707,7 @@ enum offload_act_command  {
+ 	FLOW_ACT_REPLACE,
+ 	FLOW_ACT_DESTROY,
+ 	FLOW_ACT_STATS,
++	FLOW_ACT_CHANGE, /* Committed native action identity; no count update. */
+ };
+ 
+ struct flow_offload_action {
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index 36af122..eb54a21 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -4,6 +4,7 @@
+ 
+ #include <linux/pkt_cls.h>
+ #include <linux/workqueue.h>
++#include <linux/notifier.h>
+ #include <net/sch_generic.h>
+ #include <net/act_api.h>
+ #include <net/net_namespace.h>
+@@ -43,7 +44,28 @@ struct tcf_qevent {
+ struct tcf_block_cb;
+ bool tcf_queue_work(struct rcu_work *rwork, work_func_t func);
+ 
++struct tcf_block_state {
++	unsigned int active;
++	u64 sequence;
++};
++
++struct tcf_block_event {
++	struct tcf_block *block; /* Borrowed until the SRCU callback returns. */
++	u64 sequence;
++};
++
++enum { TCF_BLOCK_CHANGE = 1 };
++
+ #ifdef CONFIG_NET_CLS
++/* Sleepable completion, outside native block/proto/callback locks. */
++int tcf_block_register_notifier(struct notifier_block *nb);
++int tcf_block_unregister_notifier(struct notifier_block *nb);
++void tcf_block_read_state(struct tcf_block *block, struct tcf_block_state *state);
++/* RTNL and an actual currently bound callback are required. */
++int tcf_block_replay_bound(struct tcf_block *block, flow_setup_cb_t *cb,
++			   void *cb_priv, bool add,
++			   struct netlink_ext_ack *extack);
++
+ struct tcf_chain *tcf_chain_get_by_act(struct tcf_block *block,
+ 				       u32 chain_index);
+ void tcf_chain_put_by_act(struct tcf_chain *chain);
+@@ -795,6 +817,7 @@ struct tc_cls_matchall_offload {
+ 	struct flow_stats stats;
+ 	bool use_act_stats;
+ 	unsigned long cookie;
++	u32 classid;
+ };
+ 
+ enum tc_clsbpf_command {
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 7b9cd55..93996c5 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -474,6 +474,8 @@ struct tcf_block {
+ 	 * attached to the block (refcnt, action_refcnt, explicitly_created).
+ 	 */
+ 	struct mutex lock;
++	unsigned int mutation_active;
++	u64 mutation_sequence;
+ 	struct list_head chain_list;
+ 	u32 index; /* block index for shared blocks */
+ 	u32 classid; /* which class this block belongs to */
+diff --git a/net/sched/act_api.c b/net/sched/act_api.c
+index f948646..ce28c04 100644
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@ -216,6 +216,20 @@ static int tcf_action_offload_cmd_ex(struct flow_offload_action *fl_act,
+ 	return 0;
+ }
+ 
++static void tcf_action_offload_change(struct tc_action *act)
++{
++	struct flow_offload_action action = {
++		.command = FLOW_ACT_CHANGE,
++		.index = act->tcfa_index,
++		.cookie = (unsigned long)act,
++	};
++
++	/* The native commit has happened. Consumers must withdraw their old
++	 * execution; their return values cannot veto or count this notification.
++	 */
++	tcf_action_offload_cmd_ex(&action, NULL);
++}
++
+ static int tcf_action_offload_cmd_cb_ex(struct flow_offload_action *fl_act,
+ 					u32 *hw_count,
+ 					flow_indr_block_bind_cb_t *cb,
+@@ -1400,6 +1414,7 @@ struct tc_action *tcf_action_init_1(struct net *net, struct tcf_proto *tp,
+ 				    u32 flags, struct netlink_ext_ack *extack)
+ {
+ 	bool police = flags & TCA_ACT_FLAGS_POLICE;
++	bool hw_changed = false;
+ 	struct nla_bitfield32 userflags = { 0, 0 };
+ 	struct tc_cookie *user_cookie = NULL;
+ 	u8 hw_stats = TCA_ACT_HW_STATS_ANY;
+@@ -1443,8 +1458,14 @@ struct tc_action *tcf_action_init_1(struct net *net, struct tcf_proto *tp,
+ 	if (!police && tb[TCA_ACT_COOKIE])
+ 		tcf_set_action_cookie(&a->user_cookie, user_cookie);
+ 
+-	if (!police)
++	if (!police) {
++		spin_lock_bh(&a->tcfa_lock);
++		hw_changed = a->hw_stats != hw_stats;
+ 		a->hw_stats = hw_stats;
++		spin_unlock_bh(&a->tcfa_lock);
++	}
++	if (*init_res != ACT_P_BOUND || hw_changed)
++		tcf_action_offload_change(a);
+ 
+ 	return a;
+ 
+@@ -1517,6 +1538,10 @@ int tcf_action_init(struct net *net, struct tcf_proto *tp, struct nlattr *nla,
+ 		if (tc_act_bind(flags)) {
+ 			bool skip_sw = tc_skip_sw(fl_flags);
+ 			bool skip_hw = tc_skip_hw(fl_flags);
++			u32 old_flags;
++
++			spin_lock_bh(&act->tcfa_lock);
++			old_flags = act->tcfa_flags;
+ 
+ 			if (tc_act_bind(act->tcfa_flags)) {
+ 				/* Action is created by classifier and is not
+@@ -1528,6 +1553,7 @@ int tcf_action_init(struct net *net, struct tcf_proto *tp, struct nlattr *nla,
+ 				 */
+ 				if ((tc_act_skip_sw(act->tcfa_flags) && !skip_sw) ||
+ 				    (tc_act_skip_hw(act->tcfa_flags) && !skip_hw)) {
++					spin_unlock_bh(&act->tcfa_lock);
+ 					NL_SET_ERR_MSG(extack,
+ 						       "Mismatch between action and filter offload flags");
+ 					err = -EINVAL;
+@@ -1537,17 +1563,24 @@ int tcf_action_init(struct net *net, struct tcf_proto *tp, struct nlattr *nla,
+ 					act->tcfa_flags |= TCA_ACT_FLAGS_SKIP_SW;
+ 				if (skip_hw)
+ 					act->tcfa_flags |= TCA_ACT_FLAGS_SKIP_HW;
++				old_flags ^= act->tcfa_flags;
++				spin_unlock_bh(&act->tcfa_lock);
++				if (old_flags & (TCA_ACT_FLAGS_SKIP_SW |
++						 TCA_ACT_FLAGS_SKIP_HW))
++					tcf_action_offload_change(act);
+ 				continue;
+ 			}
+ 
+ 			/* Action is standalone */
+ 			if (skip_sw != tc_act_skip_sw(act->tcfa_flags) ||
+ 			    skip_hw != tc_act_skip_hw(act->tcfa_flags)) {
++				spin_unlock_bh(&act->tcfa_lock);
+ 				NL_SET_ERR_MSG(extack,
+ 					       "Mismatch between action and filter offload flags");
+ 				err = -EINVAL;
+ 				goto err;
+ 			}
++			spin_unlock_bh(&act->tcfa_lock);
+ 		} else {
+ 			err = tcf_action_offload_add(act, extack);
+ 			if (tc_act_skip_sw(act->tcfa_flags) && err)
+diff --git a/net/sched/act_gact.c b/net/sched/act_gact.c
+index e949280..8b8a54f 100644
+--- a/net/sched/act_gact.c
++++ b/net/sched/act_gact.c
+@@ -240,6 +240,15 @@ static int tcf_gact_offload_act_setup(struct tc_action *act, void *entry_data,
+ 				      u32 *index_inc, bool bind,
+ 				      struct netlink_ext_ack *extack)
+ {
++#ifdef CONFIG_GACT_PROB
++	struct tcf_gact *gact = to_gact(act);
++
++	if (gact->tcfg_ptype && gact->tcfg_paction != act->tcfa_action) {
++		NL_SET_ERR_MSG_MOD(extack, "Probabilistic alternate action cannot be represented by the primary action");
++		return -EOPNOTSUPP;
++	}
++#endif
++
+ 	if (bind) {
+ 		struct flow_action_entry *entry = entry_data;
+ 
+diff --git a/net/sched/cls_api.c b/net/sched/cls_api.c
+index 3b0a438..822ff5a 100644
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -43,6 +43,50 @@
+ #include <net/flow_offload.h>
+ #include <net/tc_wrapper.h>
+ 
++SRCU_NOTIFIER_HEAD_STATIC(tcf_block_chain);
++
++int tcf_block_register_notifier(struct notifier_block *nb)
++{
++	return srcu_notifier_chain_register(&tcf_block_chain, nb);
++}
++EXPORT_SYMBOL_GPL(tcf_block_register_notifier);
++
++int tcf_block_unregister_notifier(struct notifier_block *nb)
++{
++	return srcu_notifier_chain_unregister(&tcf_block_chain, nb);
++}
++EXPORT_SYMBOL_GPL(tcf_block_unregister_notifier);
++
++void tcf_block_read_state(struct tcf_block *block, struct tcf_block_state *state)
++{
++	mutex_lock(&block->lock);
++	state->active = block->mutation_active;
++	state->sequence = block->mutation_sequence;
++	mutex_unlock(&block->lock);
++}
++EXPORT_SYMBOL_GPL(tcf_block_read_state);
++
++static void tcf_mutation_begin(struct tcf_block *block)
++{
++	mutex_lock(&block->lock);
++	block->mutation_active++;
++	mutex_unlock(&block->lock);
++}
++
++static void tcf_mutation_end(struct tcf_block *block)
++{
++	struct tcf_block_event event = { .block = block };
++
++	mutex_lock(&block->lock);
++	block->mutation_active--;
++	event.sequence = ++block->mutation_sequence;
++	mutex_unlock(&block->lock);
++	/* The caller still owns its block reference, but none of the native
++	 * proto/chain/callback locks. This channel does not count HW offloads.
++	 */
++	srcu_notifier_call_chain(&tcf_block_chain, TCF_BLOCK_CHANGE, &event);
++}
++
+ /* The list of all installed classifier types */
+ static LIST_HEAD(tcf_proto_base);
+ 
+@@ -777,17 +821,18 @@ static void tcf_block_offload_init(struct flow_block_offload *bo,
+ 				   struct net_device *dev, struct Qdisc *sch,
+ 				   enum flow_block_command command,
+ 				   enum flow_block_binder_type binder_type,
+-				   struct flow_block *flow_block,
++				   struct tcf_block *block,
+ 				   bool shared, struct netlink_ext_ack *extack)
+ {
+ 	bo->net = dev_net(dev);
+ 	bo->command = command;
+ 	bo->binder_type = binder_type;
+-	bo->block = flow_block;
++	bo->block = &block->flow_block;
++	bo->native_block = block;
+ 	bo->block_shared = shared;
+ 	bo->extack = extack;
+ 	bo->sch = sch;
+-	bo->cb_list_head = &flow_block->cb_list;
++	bo->cb_list_head = &block->flow_block.cb_list;
+ 	INIT_LIST_HEAD(&bo->cb_list);
+ }
+ 
+@@ -804,7 +849,7 @@ static void tc_block_indr_cleanup(struct flow_block_cb *block_cb)
+ 
+ 	tcf_block_offload_init(&bo, dev, sch, FLOW_BLOCK_UNBIND,
+ 			       block_cb->indr.binder_type,
+-			       &block->flow_block, tcf_block_shared(block),
++			       block, tcf_block_shared(block),
+ 			       &extack);
+ 	rtnl_lock();
+ 	down_write(&block->cb_lock);
+@@ -829,7 +874,7 @@ static int tcf_block_offload_cmd(struct tcf_block *block,
+ 	struct flow_block_offload bo = {};
+ 
+ 	tcf_block_offload_init(&bo, dev, sch, command, ei->binder_type,
+-			       &block->flow_block, tcf_block_shared(block),
++			       block, tcf_block_shared(block),
+ 			       extack);
+ 
+ 	if (dev->netdev_ops->ndo_setup_tc) {
+@@ -1623,6 +1668,28 @@ err_playback_remove:
+ 	return err;
+ }
+ 
++int tcf_block_replay_bound(struct tcf_block *block, flow_setup_cb_t *cb,
++			   void *cb_priv, bool add,
++			   struct netlink_ext_ack *extack)
++{
++	struct flow_block_cb *block_cb;
++	int err = -ENOENT;
++
++	ASSERT_RTNL();
++	down_write(&block->cb_lock);
++	list_for_each_entry(block_cb, &block->flow_block.cb_list, list) {
++		if (block_cb->cb != cb || block_cb->cb_priv != cb_priv)
++			continue;
++		err = tcf_block_playback_offloads(block, cb, cb_priv, add,
++						 tcf_block_offload_in_use(block),
++						 extack);
++		break;
++	}
++	up_write(&block->cb_lock);
++	return err;
++}
++EXPORT_SYMBOL_GPL(tcf_block_replay_bound);
++
+ static int tcf_block_bind(struct tcf_block *block,
+ 			  struct flow_block_offload *bo)
+ {
+@@ -2255,9 +2322,11 @@ static int tc_new_tfilter(struct sk_buff *skb, struct nlmsghdr *n,
+ 	int err;
+ 	int tp_created;
+ 	bool rtnl_held = false;
++	bool mutation = false;
+ 	u32 flags;
+ 
+ replay:
++	mutation = false;
+ 	tp_created = 0;
+ 
+ 	err = nlmsg_parse_deprecated(n, sizeof(*t), tca, TCA_MAX,
+@@ -2323,6 +2392,8 @@ replay:
+ 		err = PTR_ERR(block);
+ 		goto errout;
+ 	}
++	tcf_mutation_begin(block);
++	mutation = true;
+ 	block->classid = parent;
+ 
+ 	chain_index = nla_get_u32_default(tca[TCA_CHAIN], 0);
+@@ -2449,6 +2520,8 @@ errout_tp:
+ 		if (!tp_created)
+ 			tcf_chain_put(chain);
+ 	}
++	if (mutation)
++		tcf_mutation_end(block);
+ 	tcf_block_release(q, block, rtnl_held);
+ 
+ 	if (rtnl_held)
+@@ -2489,6 +2562,7 @@ static int tc_del_tfilter(struct sk_buff *skb, struct nlmsghdr *n,
+ 	void *fh = NULL;
+ 	int err;
+ 	bool rtnl_held = false;
++	bool mutation = false;
+ 
+ 	err = nlmsg_parse_deprecated(n, sizeof(*t), tca, TCA_MAX,
+ 				     rtm_tca_policy, extack);
+@@ -2537,6 +2611,8 @@ static int tc_del_tfilter(struct sk_buff *skb, struct nlmsghdr *n,
+ 		err = PTR_ERR(block);
+ 		goto errout;
+ 	}
++	tcf_mutation_begin(block);
++	mutation = true;
+ 
+ 	chain_index = nla_get_u32_default(tca[TCA_CHAIN], 0);
+ 	if (chain_index > TC_ACT_EXT_VAL_MASK) {
+@@ -2616,6 +2692,8 @@ errout:
+ 			tcf_proto_put(tp, rtnl_held, NULL);
+ 		tcf_chain_put(chain);
+ 	}
++	if (mutation)
++		tcf_mutation_end(block);
+ 	tcf_block_release(q, block, rtnl_held);
+ 
+ 	if (rtnl_held)
+@@ -3123,9 +3201,12 @@ static int tc_ctl_chain(struct sk_buff *skb, struct nlmsghdr *n,
+ 	struct tcf_block *block;
+ 	unsigned long cl;
+ 	int err;
++	bool mutation;
+ 
+ replay:
+ 	q = NULL;
++	mutation = n->nlmsg_type == RTM_NEWCHAIN ||
++		   n->nlmsg_type == RTM_DELCHAIN;
+ 	err = nlmsg_parse_deprecated(n, sizeof(*t), tca, TCA_MAX,
+ 				     rtm_tca_policy, extack);
+ 	if (err < 0)
+@@ -3139,6 +3220,8 @@ replay:
+ 			       t->tcm_ifindex, t->tcm_block_index, extack);
+ 	if (IS_ERR(block))
+ 		return PTR_ERR(block);
++	if (mutation)
++		tcf_mutation_begin(block);
+ 
+ 	chain_index = nla_get_u32_default(tca[TCA_CHAIN], 0);
+ 	if (chain_index > TC_ACT_EXT_VAL_MASK) {
+@@ -3230,6 +3313,8 @@ replay:
+ errout:
+ 	tcf_chain_put(chain);
+ errout_block:
++	if (mutation)
++		tcf_mutation_end(block);
+ 	tcf_block_release(q, block, true);
+ 	if (err == -EAGAIN)
+ 		/* Replay the request. */
+@@ -3906,6 +3991,9 @@ int tc_setup_action(struct flow_action *flow_action,
+ 			goto err_out_locked;
+ 
+ 		for (k = 0; k < index ; k++) {
++			entry[k].control_action = act->tcfa_action;
++			entry[k].action_flags = act->tcfa_flags &
++				(TCA_ACT_FLAGS_SKIP_SW | TCA_ACT_FLAGS_SKIP_HW);
+ 			entry[k].hw_stats = tc_act_hw_stats(act->hw_stats);
+ 			entry[k].hw_index = act->tcfa_index;
+ 			entry[k].cookie = (unsigned long)act;
+diff --git a/net/sched/cls_flower.c b/net/sched/cls_flower.c
+index 099ff6a..6d776c1 100644
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@ -461,7 +461,8 @@ static void fl_hw_destroy_filter(struct tcf_proto *tp, struct cls_fl_filter *f,
+ }
+ 
+ static int fl_hw_replace_filter(struct tcf_proto *tp,
+-				struct cls_fl_filter *f, bool rtnl_held,
++				struct cls_fl_filter *f,
++				struct cls_fl_filter *fold, bool rtnl_held,
+ 				struct netlink_ext_ack *extack)
+ {
+ 	struct tcf_block *block = tp->chain->block;
+@@ -476,6 +477,7 @@ static int fl_hw_replace_filter(struct tcf_proto *tp,
+ 	tc_cls_common_offload_init(&cls_flower.common, tp, f->flags, extack);
+ 	cls_flower.command = FLOW_CLS_REPLACE;
+ 	cls_flower.cookie = (unsigned long) f;
++	cls_flower.replace_cookie = (unsigned long)fold;
+ 	cls_flower.rule->match.dissector = &f->mask->dissector;
+ 	cls_flower.rule->match.mask = &f->mask->key;
+ 	cls_flower.rule->match.key = &f->mkey;
+@@ -2495,7 +2497,7 @@ static int fl_change(struct net *net, struct sk_buff *in_skb,
+ 		goto errout_mask;
+ 
+ 	if (!tc_skip_hw(fnew->flags)) {
+-		err = fl_hw_replace_filter(tp, fnew, rtnl_held, extack);
++		err = fl_hw_replace_filter(tp, fnew, fold, rtnl_held, extack);
+ 		if (err)
+ 			goto errout_ht;
+ 	}
+@@ -2693,6 +2695,22 @@ static int fl_reoffload(struct tcf_proto *tp, bool add, flow_setup_cb_t *cb,
+ 	ASSERT_RTNL();
+ 
+ 	while ((f = fl_get_next_hw_filter(tp, f, add))) {
++		tc_cls_common_offload_init(&cls_flower.common, tp, f->flags,
++					   extack);
++		cls_flower.command = add ? FLOW_CLS_REPLACE : FLOW_CLS_DESTROY;
++		cls_flower.cookie = (unsigned long)f;
++		cls_flower.rule = NULL;
++		if (!add) {
++			err = tc_setup_cb_reoffload(block, tp, false, cb,
++						    TC_SETUP_CLSFLOWER, &cls_flower,
++						    cb_priv, &f->flags,
++						    &f->in_hw_count);
++			if (err) {
++				__fl_put(f);
++				return err;
++			}
++			goto next_flow;
++		}
+ 		cls_flower.rule =
+ 			flow_rule_alloc(tcf_exts_num_actions(&f->exts));
+ 		if (!cls_flower.rule) {
+@@ -2700,11 +2718,6 @@ static int fl_reoffload(struct tcf_proto *tp, bool add, flow_setup_cb_t *cb,
+ 			return -ENOMEM;
+ 		}
+ 
+-		tc_cls_common_offload_init(&cls_flower.common, tp, f->flags,
+-					   extack);
+-		cls_flower.command = add ?
+-			FLOW_CLS_REPLACE : FLOW_CLS_DESTROY;
+-		cls_flower.cookie = (unsigned long)f;
+ 		cls_flower.rule->match.dissector = &f->mask->dissector;
+ 		cls_flower.rule->match.mask = &f->mask->key;
+ 		cls_flower.rule->match.key = &f->mkey;
+diff --git a/net/sched/cls_matchall.c b/net/sched/cls_matchall.c
+index f03bf5d..1c37c5d 100644
+--- a/net/sched/cls_matchall.c
++++ b/net/sched/cls_matchall.c
+@@ -98,6 +98,7 @@ static int mall_replace_hw_filter(struct tcf_proto *tp,
+ 	tc_cls_common_offload_init(&cls_mall.common, tp, head->flags, extack);
+ 	cls_mall.command = TC_CLSMATCHALL_REPLACE;
+ 	cls_mall.cookie = cookie;
++	cls_mall.classid = head->res.classid;
+ 
+ 	err = tc_setup_offload_action(&cls_mall.rule->action, &head->exts,
+ 				      cls_mall.common.extack);
+@@ -283,14 +284,20 @@ static int mall_reoffload(struct tcf_proto *tp, bool add, flow_setup_cb_t *cb,
+ 	if (tc_skip_hw(head->flags))
+ 		return 0;
+ 
+-	cls_mall.rule =	flow_rule_alloc(tcf_exts_num_actions(&head->exts));
+-	if (!cls_mall.rule)
+-		return -ENOMEM;
+-
+ 	tc_cls_common_offload_init(&cls_mall.common, tp, head->flags, extack);
+ 	cls_mall.command = add ?
+ 		TC_CLSMATCHALL_REPLACE : TC_CLSMATCHALL_DESTROY;
+ 	cls_mall.cookie = (unsigned long)head;
++	cls_mall.classid = head->res.classid;
++	if (!add)
++		return tc_setup_cb_reoffload(block, tp, false, cb,
++					    TC_SETUP_CLSMATCHALL, &cls_mall,
++					    cb_priv, &head->flags,
++					    &head->in_hw_count);
++
++	cls_mall.rule = flow_rule_alloc(tcf_exts_num_actions(&head->exts));
++	if (!cls_mall.rule)
++		return -ENOMEM;
+ 
+ 	err = tc_setup_offload_action(&cls_mall.rule->action, &head->exts,
+ 				      cls_mall.common.extack);

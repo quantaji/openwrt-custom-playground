@@ -183,7 +183,7 @@ ifneq ($(CONFIG_TARGET_ROOTFS_INITRAMFS),)
 # For Separate Initramf with $2 declared, skip kernel compile, it has
 # already been done previously on generic image build
 define Kernel/CompileImage/Initramfs
-	$(call locked,{ \
+	+$(call locked,{ \
 		$(if $(2),$(call Kernel/PrepareConfigPerRootfs,$(LINUX_DIR)$(2));) \
 		$(call Kernel/Configure/Initramfs,$(if $(1),$(1),$(TARGET_DIR)),$(LINUX_DIR)$(2)); \
 		$(CP) $(GENERIC_PLATFORM_DIR)/other-files/init $(if $(1),$(1),$(TARGET_DIR))/init; \

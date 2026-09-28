@@ -26,10 +26,17 @@
 #define QDX_H2N_PAGED_EMPTY	1
 #define QDX_H2N_PACKET		2
 #define QDX_H2N_CTRL		4
+#define QDX_H2N_RETURNED		9
+#define QDX_H2N_BRIDGE_RETURNED	10
 #define QDX_N2H_EMPTY		1
 #define QDX_N2H_PACKET		3
 #define QDX_N2H_COMMAND_RESP	5
 #define QDX_N2H_STATUS		6
+#define QDX_N2H_VIRTUAL		10
+#define QDX_N2H_RETURNED		11
+#define QDX_N2H_BRIDGE_RETURNED	12
+#define QDX_N2H_EXTENDED		13
+#define QDX_N2H_INGRESS_SHAPED	0x0010
 #define QDX_DESC_FIRST		0x0004
 #define QDX_DESC_LAST		0x0008
 #define QDX_DESC_NO_CSUM		0x0010
@@ -50,6 +57,17 @@
 #define QDX_N2H_DDR		9
 #define QDX_N2H_GET_PAGED_POOL	13
 #define QDX_C2C_MAP		1
+
+#define QDX_CLOCK_RATE 748800000U
+#define QDX_FREQUENCY_CHANGE 1
+#define QDX_FREQUENCY_ACK 2
+struct qdx_frequency {
+	__le32 frequency;
+	__le32 step;
+	__le32 stats_enable;
+	__le32 current_frequency;
+	__le32 ack;
+};
 
 struct qdx_ddr_info {
 	__le32 size;

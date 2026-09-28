@@ -1,0 +1,82 @@
+From: Codex
+Subject: [PATCH] netfilter: flowtable: preserve complete stacked VLAN rules
+
+Recognize both 802.1Q and 802.1ad encapsulations when constructing the
+native flow match and VLAN actions. An 802.1ad output encapsulation
+otherwise leaves an allocated action entry at the zero-valued ACCEPT ID.
+Declare the VLAN and CVLAN keys actually populated by the match builder.
+
+Flow tuple encapsulations are ordered from outermost to innermost. Emit
+push actions in reverse order so successive pushes reconstruct that
+packet layout, while retaining the original ingress-only VLAN indices.
+
+Signed-off-by: Codex
+---
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -4,6 +4,7 @@
+ #include <linux/netfilter.h>
+ #include <linux/rhashtable.h>
+ #include <linux/netdevice.h>
++#include <linux/if_vlan.h>
+ #include <linux/tc_act/tc_csum.h>
+ #include <net/flow_offload.h>
+ #include <net/netfilter/nf_flow_table.h>
+@@ -119,8 +120,9 @@
+ 	mask->meta.ingress_ifindex = 0xffffffff;
+ 
+ 	if (tuple->encap_num > 0 && !(tuple->in_vlan_ingress & BIT(0)) &&
+-	    tuple->encap[0].proto == htons(ETH_P_8021Q)) {
++	    eth_type_vlan(tuple->encap[0].proto)) {
+ 		NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_VLAN, vlan);
++		match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_VLAN);
+ 		nf_flow_rule_vlan_match(&key->vlan, &mask->vlan,
+ 					tuple->encap[0].id,
+ 					tuple->encap[0].proto);
+@@ -128,16 +130,18 @@
+ 	}
+ 
+ 	if (tuple->encap_num > 1 && !(tuple->in_vlan_ingress & BIT(1)) &&
+-	    tuple->encap[1].proto == htons(ETH_P_8021Q)) {
++	    eth_type_vlan(tuple->encap[1].proto)) {
+ 		if (vlan_encap) {
+ 			NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_CVLAN,
+ 					  cvlan);
++			match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_CVLAN);
+ 			nf_flow_rule_vlan_match(&key->cvlan, &mask->cvlan,
+ 						tuple->encap[1].id,
+ 						tuple->encap[1].proto);
+ 		} else {
+ 			NF_FLOW_DISSECTOR(match, FLOW_DISSECTOR_KEY_VLAN,
+ 					  vlan);
++			match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_VLAN);
+ 			nf_flow_rule_vlan_match(&key->vlan, &mask->vlan,
+ 						tuple->encap[1].id,
+ 						tuple->encap[1].proto);
+@@ -702,7 +706,7 @@
+ 		if (tuple->in_vlan_ingress & BIT(i))
+ 			continue;
+ 
+-		if (tuple->encap[i].proto == htons(ETH_P_8021Q)) {
++		if (eth_type_vlan(tuple->encap[i].proto)) {
+ 			entry = flow_action_entry_next(flow_rule);
+ 			if (!entry)
+ 				return -1;
+@@ -712,7 +716,8 @@
+ 
+ 	other_tuple = &flow->tuplehash[!dir].tuple;
+ 
+-	for (i = 0; i < other_tuple->encap_num; i++) {
++	/* Each push adds an outer header; build from the innermost one. */
++	for (i = other_tuple->encap_num - 1; i >= 0; i--) {
+ 		struct flow_action_entry *entry;
+ 
+ 		if (other_tuple->in_vlan_ingress & BIT(i))
+@@ -728,6 +733,7 @@
+ 			entry->pppoe.sid = other_tuple->encap[i].id;
+ 			break;
+ 		case htons(ETH_P_8021Q):
++		case htons(ETH_P_8021AD):
+ 			entry->id = FLOW_ACTION_VLAN_PUSH;
+ 			entry->vlan.vid = other_tuple->encap[i].id;
+ 			entry->vlan.proto = other_tuple->encap[i].proto;

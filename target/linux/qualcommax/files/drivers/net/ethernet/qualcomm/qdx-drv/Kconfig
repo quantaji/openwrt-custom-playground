@@ -11,7 +11,8 @@ config QDX
 	  Start both IPQ8074 NSS cores with the locally installed 11.4 firmware
 	  and provide their command, memory and wired packet transport. Linux
 	  networking and the native Ethernet drivers retain configuration
-	  ownership. Processing can be disabled while firmware keeps running.
+	  ownership. Independent QDX subsystem modules acquire and withdraw
+	  hardware delegation while firmware keeps running.
 
 	  The module is called qdx-drv. Once loaded it remains resident until
 	  system shutdown; a stopped NSS instance cannot restart in that boot.

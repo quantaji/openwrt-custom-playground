@@ -38,12 +38,25 @@ struct qdx_carrier {
 	enum dma_data_direction direction;
 	bool mapped;
 	bool charged;
+	bool accepted;
 	struct sk_buff *skb;
 	struct page *page;
 	void *buffer;
 	u64 request_id;
+	unsigned long host_charge;
+	struct qdx_tx_path *path;
+	struct qdx_packet_op *operation;
+	struct qdx_packet_recipient recipient;
 	struct qdx_port *port;
 	struct netdev_queue *queue;
+	unsigned int bytes;
+};
+
+/* One actual completion round. A changed queue flushes the previous run. */
+struct qdx_tx_batch {
+	struct qdx_port *port;
+	struct netdev_queue *queue;
+	unsigned int packets;
 	unsigned int bytes;
 };
 
@@ -70,6 +83,10 @@ struct qdx_irq {
 	unsigned int purpose;
 	bool masked;
 	bool active;
+	bool drain_requested;
+	bool draining;
+	u32 drain_remaining;
+	struct completion drain_done;
 	struct sk_buff *partial;
 	struct sk_buff *tail;
 	unsigned long partial_charge;
@@ -98,6 +115,32 @@ struct qdx_io {
 	atomic64_t faults;
 	atomic64_t dropped;
 };
+
+/* Actual calls retain the arena through preparation and producer publication.
+ * Endpoint/path refs alone retain the instance, not this arena's allocation.
+ */
+static bool qdx_io_enter(struct qdx *qdx)
+{
+	unsigned long flags;
+	bool admitted;
+
+	spin_lock_irqsave(&qdx->io_admission, flags);
+	admitted = !qdx->io_closing && !atomic_read(&qdx->failure);
+	if (admitted)
+		atomic_inc(&qdx->io_callers);
+	spin_unlock_irqrestore(&qdx->io_admission, flags);
+	return admitted;
+}
+
+static void qdx_io_leave(struct qdx *qdx)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&qdx->io_admission, flags);
+	if (atomic_dec_and_test(&qdx->io_callers))
+		wake_up_all(&qdx->io_drained);
+	spin_unlock_irqrestore(&qdx->io_admission, flags);
+}
 
 /* Chunk pointers never change while the instance can receive a return. */
 static struct qdx_carrier *qdx_slot(struct qdx_io *io, u32 slot)
@@ -172,6 +215,36 @@ static struct qdx_carrier *qdx_carrier_get(struct qdx_core *core,
 	return record;
 }
 
+static void qdx_tx_batch_complete(struct qdx_tx_batch *batch)
+{
+	struct qdx_edma *edma;
+
+	if (!batch->packets)
+		return;
+	edma = batch->port->qdx->ethernet->edma;
+	edma->info.ops->complete_tx(edma->info.context, batch->queue,
+				    batch->packets, batch->bytes);
+	qdx_port_put(batch->port);
+	*batch = (struct qdx_tx_batch) {};
+}
+
+/* Capture the exact accepted observation before releasing its carrier refs. */
+static void qdx_tx_batch_add(struct qdx_tx_batch *batch, struct qdx_carrier *record)
+{
+	if (!record->charged)
+		return;
+	if (batch->packets && batch->queue != record->queue)
+		qdx_tx_batch_complete(batch);
+	if (!batch->packets) {
+		refcount_inc(&record->port->refs);
+		batch->port = record->port;
+		batch->queue = record->queue;
+	}
+	batch->packets++;
+	batch->bytes += record->bytes;
+	record->charged = false;
+}
+
 /* Also used for unsubmitted work: the caller retains its packet/command. */
 static void qdx_carrier_put(struct qdx_core *core, struct qdx_carrier *record,
 			    bool free_storage)
@@ -189,12 +262,36 @@ static void qdx_carrier_put(struct qdx_core *core, struct qdx_carrier *record,
 					 record->direction);
 		record->mapped = false;
 	}
-	if (record->charged) {
-		struct qdx_edma *edma = core->qdx->ethernet->edma;
+	WARN_ON_ONCE(record->charged); /* Accepted returns first join their batch. */
+	if (record->accepted) {
+		/* DMA and the original returned callback ended before this point. */
+		spin_lock_irqsave(&core->qdx->io_admission, flags);
+		if (record->path)
+			record->path->accepted--;
+		else
+			record->operation->accepted--;
+		spin_unlock_irqrestore(&core->qdx->io_admission, flags);
+		record->accepted = false;
+	}
+	if (record->host_charge) {
+		atomic_long_sub(record->host_charge, &core->qdx->host_data_used);
+		record->host_charge = 0;
+	}
+	if (record->path) {
+		qdx_tx_path_put(record->path);
+		record->path = NULL;
+	}
+	if (record->operation) {
+		struct qdx_endpoint *endpoint = record->operation->endpoint;
 
-		/* The port reference keeps the native attachment alive until here. */
-		edma->info.ops->complete_tx(edma->info.context, 1, record->bytes);
-		record->charged = false;
+		/* Rejected preparation has no accepted loan; a published disposal
+		 * clears recipient before reaching this common resource release.
+		 */
+		atomic_dec(&endpoint->operations);
+		wake_up_all(&endpoint->drained);
+		qdx_owner_put(&record->recipient.owner);
+		qdx_packet_op_put(record->operation);
+		record->operation = NULL;
 	}
 	if (record->port) {
 		qdx_port_put(record->port);
@@ -227,6 +324,8 @@ static void qdx_carrier_put(struct qdx_core *core, struct qdx_carrier *record,
 		io->free_head[kind] = record->slot;
 	}
 	spin_unlock_irqrestore(&io->carriers_lock, flags);
+	if (kind == QDX_TRANSMIT && free_storage)
+		qdx_resource_progress(core, QDX_RESOURCE_CARRIER | QDX_RESOURCE_HOST_BYTES);
 }
 
 static int qdx_carrier_map(struct qdx_carrier *record)
@@ -259,7 +358,11 @@ static int qdx_publish(struct qdx_core *core, unsigned int ring_id,
 	spin_lock_irqsave(&ring->lock, flags);
 	if (ring->closed || atomic_read(&core->qdx->failure) ||
 	    !smp_load_acquire(&core->map_ready) ||
-	    (record->port && !smp_load_acquire(&record->port->available))) {
+	    (record->port && !smp_load_acquire(&record->port->available)) ||
+	    (record->path && (!smp_load_acquire(&record->path->open) ||
+		!smp_load_acquire(&record->path->endpoint->producers_open))) ||
+	    (record->operation && (!smp_load_acquire(&record->operation->open) ||
+		!smp_load_acquire(&record->operation->endpoint->producers_open)))) {
 		err = -ESHUTDOWN;
 		goto unlock;
 	}
@@ -278,6 +381,28 @@ static int qdx_publish(struct qdx_core *core, unsigned int ring_id,
 				 ((u64)core->id << 31) | record->slot);
 	desc->buffer = cpu_to_le32(record->dma);
 	desc->buffer_len = cpu_to_le16(record->length);
+	if (record->kind == QDX_CONTROL) {
+		err = qdx_command_publish(core, record->request_id);
+		if (err)
+			goto unlock;
+	}
+	if (record->path || record->operation) {
+		spin_lock(&core->qdx->io_admission);
+		if (core->qdx->io_closing || atomic_read(&core->qdx->failure) ||
+		    (record->path && !record->path->open) ||
+		    (record->operation && !record->operation->open)) {
+			spin_unlock(&core->qdx->io_admission);
+			err = -ESHUTDOWN;
+			goto unlock;
+		}
+		if (record->path)
+			record->path->accepted++;
+		else
+			record->operation->accepted++;
+		record->accepted = true;
+		spin_unlock(&core->qdx->io_admission);
+		/* No fallible step remains before producer publication. */
+	}
 	spin_lock(&io->carriers_lock);
 	record->state = QDX_PUBLISHED;
 	spin_unlock(&io->carriers_lock);
@@ -311,9 +436,13 @@ int qdx_io_command(struct qdx_core *core, void *buffer, size_t length, u64 id)
 
 	if (length > QDX_COMMAND_SIZE)
 		return -EMSGSIZE;
+	if (!qdx_io_enter(core->qdx))
+		return -ESHUTDOWN;
 	record = qdx_carrier_get(core, QDX_CONTROL);
-	if (!record)
-		return -ENOSPC;
+	if (!record) {
+		err = -ENOSPC;
+		goto leave;
+	}
 	record->buffer = buffer;
 	record->length = QDX_COMMAND_SIZE;
 	record->direction = DMA_BIDIRECTIONAL;
@@ -325,82 +454,500 @@ int qdx_io_command(struct qdx_core *core, void *buffer, size_t length, u64 id)
 		err = qdx_publish(core, QDX_COMMAND_RING, record, &desc);
 	if (err)
 		qdx_carrier_put(core, record, false);
+leave:
+	qdx_io_leave(core->qdx);
 	return err;
 }
 
-int qdx_io_send(struct qdx_port *port, struct sk_buff *skb,
-		struct netdev_queue *queue, unsigned int bytes)
-{
-	struct qdx_core *core = &port->qdx->cores[0];
-	struct qdx_h2n_desc desc = { .type = QDX_H2N_PACKET };
-	struct qdx_carrier *record;
-	int err;
+/* Wait storage belongs to an actual native queue, not a policy registry. */
+static DECLARE_WAIT_QUEUE_HEAD(qdx_resource_drained);
 
-	if (skb_is_nonlinear(skb) || skb->len > U16_MAX ||
-	    skb_headlen(skb) + skb_headroom(skb) > U16_MAX)
-		return -EMSGSIZE;
-	record = qdx_carrier_get(core, QDX_TRANSMIT);
-	if (!record)
-		return -ENOSPC;
-	refcount_inc(&port->refs);
-	record->port = port;
+static void qdx_resource_wait_put(struct qdx_resource_wait *wait)
+{
+	struct qdx_owner owner = wait->owner;
+	struct qdx_endpoint *endpoint = wait->endpoint;
+	struct qdx *qdx = endpoint->service->qdx;
+	unsigned long flags;
+	bool last;
+
+	/* Final release and rearm serialize over the same actual resource scope.
+	 * No embedded storage is touched once zero permits the owner to reuse it.
+	 */
+	spin_lock_irqsave(&qdx->resource_lock, flags);
+	last = refcount_dec_and_test(&wait->calls);
+	spin_unlock_irqrestore(&qdx->resource_lock, flags);
+	if (!last)
+		return;
+	qdx_endpoint_put(endpoint);
+	qdx_owner_put(&owner);
+	wake_up_all(&qdx_resource_drained);
+}
+
+static void qdx_resource_wait_arm(struct qdx_endpoint *endpoint,
+				  struct qdx_resource_wait *wait, unsigned int resources)
+{
+	struct qdx *qdx = endpoint->service->qdx;
+	unsigned long flags;
+	bool notify = false;
+
+	spin_lock_irqsave(&qdx->resource_lock, flags);
+	if (wait->armed) {
+		notify = (resources & QDX_RESOURCE_DESCRIPTOR) &&
+			 !(wait->resources & QDX_RESOURCE_DESCRIPTOR);
+		wait->resources = resources;
+		goto out;
+	}
+	if (WARN_ON_ONCE(qdx->last_resource_wait == U64_MAX))
+		goto out;
+	if (refcount_read(&wait->calls)) {
+		/* Credits belong to the core, not the physical endpoint. The held
+		 * endpoint only keeps that resource scope alive until calls drain.
+		 */
+		if (WARN_ON_ONCE(wait->endpoint->core != endpoint->core))
+			goto out;
+		refcount_inc(&wait->calls);
+	} else {
+		if (!qdx_owner_get(&wait->owner))
+			goto out;
+		qdx_endpoint_hold(endpoint);
+		wait->endpoint = endpoint;
+		refcount_set(&wait->calls, 1);
+	}
+	wait->resources = resources;
+	wait->serial = ++qdx->last_resource_wait;
+	wait->armed = true;
+	list_add_tail(&wait->node, &qdx->resource_waits);
+	notify = resources & QDX_RESOURCE_DESCRIPTOR;
+out:
+	spin_unlock_irqrestore(&qdx->resource_lock, flags);
+	if (notify)
+		qdx_hw_notify(endpoint->core, QDX_DB_UNBLOCKED);
+}
+
+void qdx_tx_wait_arm(struct qdx_tx_path *path, struct qdx_resource_wait *wait,
+		     unsigned int resources)
+{
+	qdx_resource_wait_arm(path->endpoint, wait, resources);
+}
+EXPORT_SYMBOL_GPL(qdx_tx_wait_arm);
+
+void qdx_packet_op_wait_arm(struct qdx_packet_op *operation,
+			   struct qdx_resource_wait *wait, unsigned int resources)
+{
+	qdx_resource_wait_arm(operation->endpoint, wait, resources);
+}
+EXPORT_SYMBOL_GPL(qdx_packet_op_wait_arm);
+
+void qdx_resource_wait_disarm(struct qdx_resource_wait *wait)
+{
+	struct qdx *qdx;
+	unsigned long flags;
+	bool detached = false;
+
+	/* The actual queue owner serializes arm/disarm; admitted callbacks have
+	 * their own refs. A zero count has no retained endpoint to dereference.
+	 */
+	if (!READ_ONCE(wait->armed))
+		return;
+	qdx = wait->endpoint->service->qdx;
+	spin_lock_irqsave(&qdx->resource_lock, flags);
+	if (wait->armed) {
+		list_del_init(&wait->node);
+		wait->armed = false;
+		detached = true;
+	}
+	spin_unlock_irqrestore(&qdx->resource_lock, flags);
+	if (detached)
+		qdx_resource_wait_put(wait);
+}
+EXPORT_SYMBOL_GPL(qdx_resource_wait_disarm);
+
+void qdx_resource_wait_drain(struct qdx_resource_wait *wait)
+{
+	qdx_resource_wait_disarm(wait);
+	wait_event(qdx_resource_drained, !refcount_read(&wait->calls));
+}
+EXPORT_SYMBOL_GPL(qdx_resource_wait_drain);
+
+void qdx_resource_progress(struct qdx_core *core, unsigned int resources)
+{
+	struct qdx *qdx = core->qdx;
+	struct qdx_resource_wait *wait, *found;
+	unsigned long flags;
+	u64 cursor = 0, limit;
+
+	spin_lock_irqsave(&qdx->resource_lock, flags);
+	limit = qdx->last_resource_wait;
+	spin_unlock_irqrestore(&qdx->resource_lock, flags);
+	for (;;) {
+		found = NULL;
+		spin_lock_irqsave(&qdx->resource_lock, flags);
+		list_for_each_entry(wait, &qdx->resource_waits, node) {
+			unsigned int relevant = resources;
+
+			if (wait->serial <= cursor || wait->serial > limit)
+				continue;
+			cursor = wait->serial;
+			if (wait->endpoint->core != core)
+				relevant &= QDX_RESOURCE_HOST_BYTES;
+			if (!(wait->resources & relevant))
+				continue;
+			refcount_inc(&wait->calls);
+			found = wait;
+			break;
+		}
+		spin_unlock_irqrestore(&qdx->resource_lock, flags);
+		if (!found)
+			return;
+		found->progress(found->owner.object);
+		qdx_resource_wait_put(found);
+	}
+}
+
+/* Packet readiness reserves nothing; publication repeats its admission check. */
+static struct qdx_ready qdx_data_ready(struct qdx_endpoint *endpoint, size_t charge)
+{
+	struct qdx_core *core = endpoint->core;
+	struct qdx *qdx = core->qdx;
+	struct qdx_io *io = READ_ONCE(core->io);
+	struct qdx_ready ready = { .status = QDX_CLOSED, .error = -ESHUTDOWN };
+	unsigned long flags;
+	u32 producer, consumer;
+
+	if (!io || !qdx_endpoint_command_ready(endpoint))
+		return ready;
+	if (charge > qdx->limits.host_data_bytes)
+		return (struct qdx_ready) { .status = QDX_REFUSED, .error = -EMSGSIZE };
+	spin_lock_irqsave(&io->h2n[QDX_DATA_RING].lock, flags);
+	producer = le32_to_cpu(READ_ONCE(core->map->h2n_host[QDX_DATA_RING]));
+	consumer = le32_to_cpu(READ_ONCE(core->map->h2n_firmware[QDX_DATA_RING]));
+	if (producer >= QDX_RING_DEPTH || consumer >= QDX_RING_DEPTH) {
+		ready.error = -EPROTO;
+		goto out;
+	}
+	if (io->h2n[QDX_DATA_RING].closed)
+		goto out;
+	if (((producer + 1) & (QDX_RING_DEPTH - 1)) == consumer)
+		ready.resources |= QDX_RESOURCE_DESCRIPTOR;
+	spin_lock(&io->carriers_lock);
+	if (io->free_head[QDX_TRANSMIT] == QDX_NO_SLOT)
+		ready.resources |= QDX_RESOURCE_CARRIER;
+	spin_unlock(&io->carriers_lock);
+	if (charge > qdx->limits.host_data_bytes - atomic_long_read(&qdx->host_data_used))
+		ready.resources |= QDX_RESOURCE_HOST_BYTES;
+	ready.status = ready.resources ? QDX_RESOURCE_WAIT : QDX_ACCEPTED;
+	ready.error = ready.resources ? -ENOSPC : 0;
+out:
+	spin_unlock_irqrestore(&io->h2n[QDX_DATA_RING].lock, flags);
+	if (ready.error == -EPROTO)
+		qdx_fail(qdx, ready.error);
+	return ready;
+}
+
+struct qdx_ready qdx_tx_ready(struct qdx_tx_path *path, size_t charge)
+{
+	struct qdx *qdx = path->endpoint->service->qdx;
+	struct qdx_ready ready = { .status = QDX_CLOSED, .error = -ESHUTDOWN };
+
+	if (!smp_load_acquire(&path->open) || !qdx_io_enter(qdx))
+		return ready;
+	ready = qdx_data_ready(path->endpoint, charge);
+	qdx_io_leave(qdx);
+	return ready;
+}
+
+EXPORT_SYMBOL_GPL(qdx_tx_ready);
+
+struct qdx_ready qdx_packet_op_ready(struct qdx_packet_op *operation, size_t charge)
+{
+	struct qdx *qdx = operation->endpoint->service->qdx;
+	struct qdx_ready ready = { .status = QDX_CLOSED, .error = -ESHUTDOWN };
+
+	if (!smp_load_acquire(&operation->open) || !qdx_io_enter(qdx))
+		return ready;
+	ready = qdx_data_ready(operation->endpoint, charge);
+	qdx_io_leave(qdx);
+	return ready;
+}
+
+EXPORT_SYMBOL_GPL(qdx_packet_op_ready);
+
+/* The retained object outlives this query; no IO arena access is required. */
+bool qdx_tx_drained(struct qdx_tx_path *path)
+{
+	struct qdx *qdx = path->endpoint->service->qdx;
+	unsigned long flags;
+	bool drained;
+
+	spin_lock_irqsave(&qdx->io_admission, flags);
+	drained = !path->open && !path->accepted;
+	spin_unlock_irqrestore(&qdx->io_admission, flags);
+	return drained;
+}
+EXPORT_SYMBOL_GPL(qdx_tx_drained);
+
+bool qdx_packet_op_drained(struct qdx_packet_op *operation)
+{
+	struct qdx *qdx = operation->endpoint->service->qdx;
+	unsigned long flags;
+	bool drained;
+
+	spin_lock_irqsave(&qdx->io_admission, flags);
+	drained = !operation->open && !operation->accepted;
+	spin_unlock_irqrestore(&qdx->io_admission, flags);
+	return drained;
+}
+EXPORT_SYMBOL_GPL(qdx_packet_op_drained);
+
+static bool qdx_host_reserve(struct qdx *qdx, unsigned long charge)
+{
+	long used = atomic_long_read(&qdx->host_data_used), old;
+
+	for (;;) {
+		if (charge > qdx->limits.host_data_bytes - used)
+			return false;
+		old = atomic_long_cmpxchg(&qdx->host_data_used, used, used + charge);
+		if (old == used)
+			return true;
+		used = old;
+	}
+}
+
+static struct qdx_carrier *qdx_packet_prepare(struct qdx_endpoint *endpoint,
+					    struct sk_buff *skb, struct qdx_ready *ready)
+{
+	struct qdx_carrier *record;
+
+	if (skb_is_nonlinear(skb) || skb->len < ETH_HLEN || skb->len > U16_MAX ||
+	    skb_headroom(skb) > U16_MAX - skb_headlen(skb)) {
+		*ready = (struct qdx_ready) { .status = QDX_REFUSED, .error = -EMSGSIZE };
+		return NULL;
+	}
+	*ready = qdx_data_ready(endpoint, skb->truesize);
+	if (ready->status != QDX_ACCEPTED)
+		return NULL;
+	record = qdx_carrier_get(endpoint->core, QDX_TRANSMIT);
+	if (!record) {
+		*ready = (struct qdx_ready) { .status = QDX_RESOURCE_WAIT,
+			.resources = QDX_RESOURCE_CARRIER, .error = -ENOSPC };
+		return NULL;
+	}
+	if (!qdx_host_reserve(endpoint->service->qdx, skb->truesize)) {
+		qdx_carrier_put(endpoint->core, record, false);
+		*ready = (struct qdx_ready) { .status = QDX_RESOURCE_WAIT,
+			.resources = QDX_RESOURCE_HOST_BYTES, .error = -ENOSPC };
+		return NULL;
+	}
+	record->host_charge = skb->truesize;
 	record->skb = skb;
 	record->length = skb_headroom(skb) + skb_headlen(skb);
-	record->direction = DMA_TO_DEVICE;
+	return record;
+}
+
+static struct qdx_ready qdx_packet_publish(struct qdx_endpoint *endpoint,
+					   struct qdx_carrier *record, u32 class_tag, u8 type)
+{
+	struct qdx_h2n_desc desc = {
+		.interface = cpu_to_le32(endpoint->ifnum),
+		.type = type,
+		.qos = cpu_to_le32(class_tag),
+		.payload_off = cpu_to_le16(skb_headroom(record->skb)),
+		.payload_len = cpu_to_le16(record->skb->len),
+		.flags = cpu_to_le16(QDX_DESC_FIRST | QDX_DESC_LAST | QDX_DESC_NO_CSUM),
+	};
+	int error;
+
+	error = qdx_carrier_map(record);
+	if (!error)
+		error = qdx_publish(endpoint->core, QDX_DATA_RING, record, &desc);
+	if (!error)
+		return (struct qdx_ready) { .status = QDX_ACCEPTED };
+	qdx_carrier_put(endpoint->core, record, false);
+	return (struct qdx_ready) {
+		.status = error == -ENOSPC ? QDX_RESOURCE_WAIT :
+			error == -ESHUTDOWN ? QDX_CLOSED : QDX_REFUSED,
+		.resources = error == -ENOSPC ? QDX_RESOURCE_DESCRIPTOR : 0,
+		.error = error,
+	};
+}
+
+struct qdx_ready qdx_xmit(struct qdx_tx_path *path, struct sk_buff *skb,
+		struct qdx_tx_class class, struct netdev_queue *queue, unsigned int bytes)
+{
+	struct qdx *qdx = path->endpoint->service->qdx;
+	struct qdx_carrier *record;
+	struct qdx_ready ready;
+
+	if (!smp_load_acquire(&path->open) || class.token != path->class.token ||
+	    class.tag != path->class.tag)
+		return (struct qdx_ready) { .status = QDX_CLOSED, .error = -ESTALE };
+	if (!queue || queue->dev != path->port->conduit)
+		return (struct qdx_ready) { .status = QDX_REFUSED, .error = -EINVAL };
+	if (!qdx_io_enter(qdx))
+		return (struct qdx_ready) { .status = QDX_CLOSED, .error = -ESHUTDOWN };
+	record = qdx_packet_prepare(path->endpoint, skb, &ready);
+	if (!record)
+		goto leave;
+	qdx_tx_path_get(path);
+	record->path = path;
+	refcount_inc(&path->port->refs);
+	record->port = path->port;
 	record->queue = queue;
 	record->bytes = bytes;
-	desc.interface = cpu_to_le32(port->ifnum);
-	desc.qos = cpu_to_le32(skb->priority);
-	desc.payload_off = cpu_to_le16(skb_headroom(skb));
-	desc.payload_len = cpu_to_le16(skb->len);
-	desc.flags = cpu_to_le16(QDX_DESC_FIRST | QDX_DESC_LAST | QDX_DESC_NO_CSUM);
-	err = qdx_carrier_map(record);
-	if (!err)
-		err = qdx_publish(core, QDX_DATA_RING, record, &desc);
-	if (err) {
-		qdx_carrier_put(core, record, false);
-		if (err == -ENOSPC)
-			qdx_hw_notify(core, QDX_DB_UNBLOCKED);
+	record->direction = DMA_TO_DEVICE;
+	ready = qdx_packet_publish(path->endpoint, record, class.tag, QDX_H2N_PACKET);
+leave:
+	qdx_io_leave(qdx);
+	return ready;
+}
+EXPORT_SYMBOL_GPL(qdx_xmit);
+
+struct qdx_packet_op *qdx_packet_op_prepare(struct qdx_endpoint *endpoint,
+					  u32 class_tag, u8 category)
+{
+	struct qdx_packet_op *operation;
+
+	if (category != QDX_RECEIVE_RETURNED && category != QDX_RECEIVE_BRIDGE_RETURNED)
+		return ERR_PTR(-EOPNOTSUPP);
+	if (!qdx_endpoint_command_ready(endpoint))
+		return ERR_PTR(-ESHUTDOWN);
+	operation = kzalloc(sizeof(*operation), GFP_KERNEL);
+	if (!operation)
+		return ERR_PTR(-ENOMEM);
+	qdx_endpoint_hold(endpoint);
+	operation->endpoint = endpoint;
+	operation->class_tag = class_tag;
+	operation->category = category;
+	operation->open = true;
+	refcount_set(&operation->refs, 1);
+	return operation;
+}
+EXPORT_SYMBOL_GPL(qdx_packet_op_prepare);
+
+void qdx_packet_op_close(struct qdx_packet_op *operation)
+{
+	struct qdx *qdx = operation->endpoint->service->qdx;
+	struct qdx_io *io;
+	unsigned long flags;
+
+	if (!qdx_io_enter(qdx)) {
+		spin_lock_irqsave(&qdx->io_admission, flags);
+		smp_store_release(&operation->open, false);
+		spin_unlock_irqrestore(&qdx->io_admission, flags);
+		return;
 	}
-	return err;
+	io = READ_ONCE(operation->endpoint->core->io);
+	if (io) {
+		spin_lock_irqsave(&io->h2n[QDX_DATA_RING].lock, flags);
+		spin_lock(&qdx->io_admission);
+		smp_store_release(&operation->open, false);
+		spin_unlock(&qdx->io_admission);
+		spin_unlock_irqrestore(&io->h2n[QDX_DATA_RING].lock, flags);
+	} else {
+		spin_lock_irqsave(&qdx->io_admission, flags);
+		smp_store_release(&operation->open, false);
+		spin_unlock_irqrestore(&qdx->io_admission, flags);
+	}
+	qdx_io_leave(qdx);
+}
+EXPORT_SYMBOL_GPL(qdx_packet_op_close);
+
+void qdx_packet_op_put(struct qdx_packet_op *operation)
+{
+	if (!operation || !refcount_dec_and_test(&operation->refs))
+		return;
+	qdx_endpoint_put(operation->endpoint);
+	kfree(operation);
+}
+EXPORT_SYMBOL_GPL(qdx_packet_op_put);
+
+struct qdx_ready qdx_packet_op_submit(struct qdx_packet_op *operation,
+		struct sk_buff *skb, const struct qdx_packet_recipient *recipient)
+{
+	struct qdx_endpoint *endpoint = operation->endpoint;
+	struct qdx_carrier *record;
+	struct qdx_ready ready;
+	int error;
+
+	if (!recipient || !recipient->returned || !smp_load_acquire(&operation->open))
+		return (struct qdx_ready) { .status = QDX_CLOSED, .error = -ESHUTDOWN };
+	if (skb_is_nonlinear(skb))
+		return (struct qdx_ready) { .status = QDX_REFUSED, .error = -EMSGSIZE };
+	/* The native boundary has already prepared the frame. Only writable DMA
+	 * storage is required here; original metadata and ownership are retained.
+	 */
+	error = skb_unclone(skb, GFP_ATOMIC);
+	if (error)
+		return (struct qdx_ready) { .status = QDX_REFUSED, .error = error };
+	if (!qdx_io_enter(endpoint->service->qdx))
+		return (struct qdx_ready) { .status = QDX_CLOSED, .error = -ESHUTDOWN };
+	record = qdx_packet_prepare(endpoint, skb, &ready);
+	if (!record)
+		goto leave;
+	if (!qdx_owner_get(&recipient->owner)) {
+		qdx_carrier_put(endpoint->core, record, false);
+		ready = (struct qdx_ready) { .status = QDX_CLOSED, .error = -ESHUTDOWN };
+		goto leave;
+	}
+	refcount_inc(&operation->refs);
+	atomic_inc(&endpoint->operations);
+	record->operation = operation;
+	record->recipient = *recipient;
+	record->direction = DMA_BIDIRECTIONAL;
+	ready = qdx_packet_publish(endpoint, record, operation->class_tag,
+		operation->category == QDX_RECEIVE_RETURNED ?
+		QDX_H2N_RETURNED : QDX_H2N_BRIDGE_RETURNED);
+leave:
+	qdx_io_leave(endpoint->service->qdx);
+	return ready;
+}
+EXPORT_SYMBOL_GPL(qdx_packet_op_submit);
+
+void qdx_io_tx_close(struct qdx_tx_path *path)
+{
+	struct qdx *qdx = path->endpoint->service->qdx;
+	struct qdx_io *io;
+	unsigned long flags;
+
+	if (!qdx_io_enter(qdx)) {
+		spin_lock_irqsave(&qdx->io_admission, flags);
+		smp_store_release(&path->open, false);
+		spin_unlock_irqrestore(&qdx->io_admission, flags);
+		return;
+	}
+	io = READ_ONCE(path->endpoint->core->io);
+	if (io) {
+		spin_lock_irqsave(&io->h2n[QDX_DATA_RING].lock, flags);
+		spin_lock(&qdx->io_admission);
+		smp_store_release(&path->open, false);
+		spin_unlock(&qdx->io_admission);
+		spin_unlock_irqrestore(&io->h2n[QDX_DATA_RING].lock, flags);
+	} else {
+		spin_lock_irqsave(&qdx->io_admission, flags);
+		smp_store_release(&path->open, false);
+		spin_unlock_irqrestore(&qdx->io_admission, flags);
+	}
+	qdx_io_leave(qdx);
 }
 
 void qdx_io_port_close(struct qdx_port *port)
 {
-	struct qdx_io *io = port->qdx->cores[0].io;
+	struct qdx_io *io;
 	unsigned long flags;
 
-	if (!io) {
-		WRITE_ONCE(port->available, false);
+	if (!qdx_io_enter(port->qdx)) {
+		smp_store_release(&port->available, false);
 		return;
 	}
-	spin_lock_irqsave(&io->h2n[QDX_DATA_RING].lock, flags);
-	smp_store_release(&port->available, false);
-	spin_unlock_irqrestore(&io->h2n[QDX_DATA_RING].lock, flags);
-}
-
-bool qdx_io_has_space(struct qdx *qdx)
-{
-	struct qdx_core *core = &qdx->cores[0];
-	struct qdx_io *io = core->io;
-	unsigned long flags;
-	u32 producer, consumer;
-	bool space = false;
-
-	if (!io || !smp_load_acquire(&core->map_ready) || atomic_read(&qdx->failure))
-		return false;
-	spin_lock_irqsave(&io->h2n[QDX_DATA_RING].lock, flags);
-	producer = le32_to_cpu(READ_ONCE(core->map->h2n_host[QDX_DATA_RING]));
-	consumer = le32_to_cpu(READ_ONCE(core->map->h2n_firmware[QDX_DATA_RING]));
-	spin_lock(&io->carriers_lock);
-	if (!io->h2n[QDX_DATA_RING].closed && producer < QDX_RING_DEPTH &&
-	    consumer < QDX_RING_DEPTH && io->free_head[QDX_TRANSMIT] != QDX_NO_SLOT)
-		space = ((producer + 1) & (QDX_RING_DEPTH - 1)) != consumer;
-	spin_unlock(&io->carriers_lock);
-	spin_unlock_irqrestore(&io->h2n[QDX_DATA_RING].lock, flags);
-	if (!space && !READ_ONCE(io->closed))
-		qdx_hw_notify(core, QDX_DB_UNBLOCKED);
-	return space;
+	io = READ_ONCE(port->qdx->cores[0].io);
+	if (io) {
+		spin_lock_irqsave(&io->h2n[QDX_DATA_RING].lock, flags);
+		smp_store_release(&port->available, false);
+		spin_unlock_irqrestore(&io->h2n[QDX_DATA_RING].lock, flags);
+	} else {
+		smp_store_release(&port->available, false);
+	}
+	qdx_io_leave(port->qdx);
 }
 
 static void qdx_irq_unmask(struct qdx_irq *ctx)
@@ -790,6 +1337,7 @@ static void qdx_packet_assemble(struct qdx_irq *ctx, struct sk_buff *skb,
 	u16 flags = le16_to_cpu(desc->flags);
 	unsigned int target = interface >> 24;
 	unsigned int needed, tailroom, old_size;
+	struct qdx_rx_meta metadata;
 	unsigned long extra = 0, cost, actual;
 	bool first = flags & QDX_DESC_FIRST;
 	bool last = flags & QDX_DESC_LAST;
@@ -863,8 +1411,15 @@ static void qdx_packet_assemble(struct qdx_irq *ctx, struct sk_buff *skb,
 	skb->ip_summed = flags & 2 ? CHECKSUM_UNNECESSARY : CHECKSUM_NONE;
 	/* The Linux receive continuation owns the full packet from this point. */
 	atomic_long_sub(memory_charge, &qdx->rx_memory_charged);
-	qdx_ethernet_receive(qdx, target ? target - 1 : ctx->core->id,
-			     interface & GENMASK(23, 0), skb, &ctx->napi);
+	metadata = (struct qdx_rx_meta) {
+		.ifnum = interface & GENMASK(23, 0),
+		.core = target ? target - 1 : ctx->core->id,
+		.service_code = desc->service,
+		.type = desc->type,
+		.flags = flags,
+		.priority = ctx->priority,
+	};
+	qdx_endpoint_packet(&qdx->cores[metadata.core], skb, &metadata, &ctx->napi);
 	return;
 drop:
 	dev_kfree_skb_any(skb);
@@ -877,7 +1432,49 @@ drop:
 	atomic64_inc(&io->dropped);
 }
 
-static void qdx_return(struct qdx_irq *ctx, struct qdx_n2h_desc *desc)
+static void qdx_operation_return(struct qdx_irq *ctx, struct qdx_carrier *record,
+				 const struct qdx_n2h_desc *desc)
+{
+	struct qdx_rx_meta metadata = {};
+	struct sk_buff *original = record->skb, *returned = NULL;
+	u32 wire_interface;
+	u16 offset, length;
+
+	if (desc) {
+		wire_interface = le32_to_cpu(desc->interface);
+		metadata.ifnum = wire_interface & GENMASK(23, 0);
+		metadata.core = wire_interface >> 24 ? (wire_interface >> 24) - 1 : ctx->core->id;
+		metadata.service_code = desc->service;
+		metadata.type = desc->type;
+		metadata.flags = le16_to_cpu(desc->flags);
+		metadata.priority = desc->priority;
+		offset = le16_to_cpu(desc->payload_off);
+		length = le16_to_cpu(desc->payload_len);
+		if (desc->type != QDX_N2H_EMPTY && length >= ETH_HLEN &&
+		    (metadata.flags & (QDX_DESC_FIRST | QDX_DESC_LAST)) ==
+				      (QDX_DESC_FIRST | QDX_DESC_LAST)) {
+			/* This admitted linear mapping already is suitable skb storage.
+			 * Keep original host priority, mark, protocol, dst and loan cb;
+			 * only the validated frame offsets/length may have moved.
+			 */
+			skb_headers_offset_update(original, offset - skb_headroom(original));
+			original->data = original->head + offset;
+			original->len = length;
+			original->data_len = 0;
+			skb_set_tail_pointer(original, length);
+			returned = original;
+			record->skb = NULL;
+		}
+	}
+	/* The recipient consumes every returned skb; the carrier still owns an
+	 * original which was not transferred. Never reread its cb after this call.
+	 */
+	record->recipient.returned(record->recipient.owner.object, original, returned,
+				   desc ? &metadata : NULL, ctx ? &ctx->napi : NULL);
+}
+
+static void qdx_return(struct qdx_irq *ctx, struct qdx_n2h_desc *desc,
+		       struct qdx_tx_batch *batch)
 {
 	struct qdx_core *arrival = ctx->core, *owner = NULL;
 	struct qdx_carrier *record;
@@ -886,6 +1483,7 @@ static void qdx_return(struct qdx_irq *ctx, struct qdx_n2h_desc *desc)
 	u32 interface = le32_to_cpu(desc->interface);
 	unsigned int target = interface >> 24;
 	void *payload;
+	bool fresh = false;
 
 	record = qdx_return_claim(arrival, desc, &owner);
 	if (!record || !qdx_return_valid(record, desc)) {
@@ -900,6 +1498,10 @@ static void qdx_return(struct qdx_irq *ctx, struct qdx_n2h_desc *desc)
 	else
 		dma_unmap_single(record->dev, record->dma, record->length, record->direction);
 	record->mapped = false;
+	if (record->operation) {
+		qdx_operation_return(ctx, record, desc);
+		goto reclaimed;
+	}
 	switch (desc->type) {
 	case QDX_N2H_EMPTY:
 		break;
@@ -921,15 +1523,20 @@ static void qdx_return(struct qdx_irq *ctx, struct qdx_n2h_desc *desc)
 			qdx_fail(arrival->qdx, -EPROTO);
 		break;
 	case QDX_N2H_PACKET:
+	case QDX_N2H_VIRTUAL:
+	case QDX_N2H_EXTENDED:
+		fresh = true;
 		skb = qdx_return_packet(owner->qdx, record, desc, &memory_charge);
 		break;
 	default:
 		atomic64_inc(&arrival->io->dropped);
 		break;
 	}
+reclaimed:
+	qdx_tx_batch_add(batch, record);
 	qdx_carrier_put(owner, record, true);
 	atomic64_inc(&owner->io->returned);
-	if (desc->type == QDX_N2H_PACKET)
+	if (fresh)
 		qdx_packet_assemble(ctx, skb, desc, memory_charge);
 	if (!READ_ONCE(owner->io->closed)) {
 		mod_delayed_work(system_wq, &owner->io->supply[0].work, 0);
@@ -943,7 +1550,9 @@ static int qdx_poll(struct napi_struct *napi, int budget)
 	struct qdx_core *core = ctx->core;
 	struct qdx_io *io = core->io;
 	struct qdx_n2h_desc desc;
+	struct qdx_tx_batch batch = {};
 	u32 producer, consumer;
+	unsigned long flags;
 	int ring, done = 0;
 
 	if (!budget)
@@ -972,7 +1581,7 @@ static int qdx_poll(struct napi_struct *napi, int budget)
 			return 0;
 		}
 		if (ctx->purpose == 2)
-			qdx_ethernet_wake(core->qdx);
+			qdx_resource_progress(core, QDX_RESOURCE_DESCRIPTOR);
 		else if (ctx->purpose == 7)
 			qdx_fail(core->qdx, -EIO);
 		/* Profiling is disabled in the supplied control allocation. */
@@ -987,16 +1596,40 @@ static int qdx_poll(struct napi_struct *napi, int budget)
 		napi_complete_done(napi, 0);
 		return 0;
 	}
+	/* Only this real NAPI owner captures and advances the prefix. */
+	spin_lock_irqsave(&ctx->lock, flags);
+	if (ctx->drain_requested) {
+		ctx->drain_requested = false;
+		ctx->draining = true;
+		ctx->drain_remaining = (producer - consumer) & (QDX_RING_DEPTH - 1);
+	}
+	spin_unlock_irqrestore(&ctx->lock, flags);
 	dma_rmb();
-	while (consumer != producer && done < budget) {
+	while (consumer != producer && done < budget &&
+	       !(ctx->draining && !ctx->drain_remaining)) {
 		desc = core->n2h_desc[ring][consumer];
-		qdx_return(ctx, &desc);
+		qdx_return(ctx, &desc, &batch);
+		if (ctx->draining && ctx->drain_remaining)
+			ctx->drain_remaining--;
 		consumer = (consumer + 1) & (QDX_RING_DEPTH - 1);
 		done++;
 	}
+	qdx_tx_batch_complete(&batch);
 	dma_wmb();
 	WRITE_ONCE(core->map->n2h_host[ring], cpu_to_le32(consumer));
-	qdx_ethernet_wake(core->qdx);
+	if (ctx->draining && !ctx->drain_remaining) {
+		/* Disposal ends a partial which crosses the captured boundary.
+		 * Later non-FIRST fragments encounter an empty assembler and drop.
+		 */
+		dev_kfree_skb_any(ctx->partial);
+		atomic_long_sub(ctx->partial_charge, &core->qdx->rx_memory_charged);
+		ctx->partial = NULL;
+		ctx->tail = NULL;
+		WRITE_ONCE(ctx->partial_charge, 0);
+		ctx->draining = false;
+		complete_all(&ctx->drain_done);
+	}
+	qdx_resource_progress(core, QDX_RESOURCE_DESCRIPTOR);
 	if (done == budget)
 		return budget;
 	/* Keep polling for producer progress observed before IRQ rearming. */
@@ -1008,8 +1641,20 @@ static int qdx_poll(struct napi_struct *napi, int budget)
 	}
 	if (producer != consumer)
 		return budget;
-	if (napi_complete_done(napi, done))
-		qdx_irq_unmask(ctx);
+	spin_lock_irqsave(&ctx->lock, flags);
+	/* A request racing the poll tail must retain NAPI ownership. Otherwise
+	 * schedule before complete would lose the only requested capture.
+	 */
+	if (ctx->drain_requested) {
+		spin_unlock_irqrestore(&ctx->lock, flags);
+		return budget;
+	}
+	if (napi_complete_done(napi, done) && ctx->active && ctx->masked &&
+	    READ_ONCE(io->running)) {
+		ctx->masked = false;
+		enable_irq(ctx->irq);
+	}
+	spin_unlock_irqrestore(&ctx->lock, flags);
 	return done;
 }
 
@@ -1078,6 +1723,7 @@ int qdx_io_init(struct qdx_core *core)
 		ctx->purpose = i;
 		ctx->masked = true;
 		spin_lock_init(&ctx->lock);
+		init_completion(&ctx->drain_done);
 		if (i >= 3 && i <= 6)
 			snprintf(name, sizeof(name), "data%u-%u", core->id, i - 3);
 		else
@@ -1096,6 +1742,62 @@ int qdx_io_init(struct qdx_core *core)
 		io->irq_count++;
 	}
 	return 0;
+}
+
+int qdx_io_receive_drain(struct qdx *qdx)
+{
+	struct qdx_core *core;
+	struct qdx_irq *ctx;
+	unsigned long flags, deadline = jiffies + msecs_to_jiffies(3000);
+	unsigned int c, i;
+	int error = 0;
+
+	mutex_lock(&qdx->receive_drain);
+	if (smp_load_acquire(&qdx->access_ended))
+		goto out;
+	for (c = 0; c < QDX_CORES; c++) {
+		core = &qdx->cores[c];
+		if (!core->io || !smp_load_acquire(&core->map_ready) ||
+		    atomic_read(&qdx->failure)) {
+			error = -ESHUTDOWN;
+			goto out;
+		}
+		for (i = 0; i < core->io->irq_count; i++) {
+			if (i != 1 && (i < 3 || i > 6))
+				continue;
+			ctx = &core->io->irq[i];
+			spin_lock_irqsave(&ctx->lock, flags);
+			if (!ctx->active || !READ_ONCE(core->io->running)) {
+				spin_unlock_irqrestore(&ctx->lock, flags);
+				error = -ESHUTDOWN;
+				goto out;
+			}
+			reinit_completion(&ctx->drain_done);
+			ctx->drain_requested = true;
+			if (!ctx->masked) {
+				disable_irq_nosync(ctx->irq);
+				ctx->masked = true;
+			}
+			napi_schedule_irqoff(&ctx->napi);
+			spin_unlock_irqrestore(&ctx->lock, flags);
+		}
+	}
+	for (c = 0; c < QDX_CORES; c++) {
+		core = &qdx->cores[c];
+		for (i = 0; i < core->io->irq_count; i++) {
+			if (i != 1 && (i < 3 || i > 6))
+				continue;
+			ctx = &core->io->irq[i];
+			if (time_after_eq(jiffies, deadline) ||
+			    !wait_for_completion_timeout(&ctx->drain_done, deadline - jiffies)) {
+				error = -ETIMEDOUT;
+				goto out;
+			}
+		}
+	}
+out:
+	mutex_unlock(&qdx->receive_drain);
+	return error;
 }
 
 void qdx_io_enable(struct qdx_core *core)
@@ -1173,6 +1875,7 @@ void qdx_io_release(struct qdx_core *core, bool access_ended)
 {
 	struct qdx_io *io = core->io;
 	struct qdx_carrier *record;
+	struct qdx_tx_batch batch = {};
 	unsigned int i;
 
 	if (!io)
@@ -1182,11 +1885,22 @@ void qdx_io_release(struct qdx_core *core, bool access_ended)
 		record = qdx_slot(io, i);
 		if (record->state == QDX_FREE || record->state == QDX_RETIRED)
 			continue;
-		if (access_ended || record->state == QDX_PREPARED)
+		if (access_ended || record->state == QDX_PREPARED) {
+			if (record->operation) {
+				/* Access end precedes loan disposal and original free. */
+				if (record->mapped) {
+					dma_unmap_single(record->dev, record->dma, record->length,
+							 record->direction);
+					record->mapped = false;
+				}
+				qdx_operation_return(NULL, record, NULL);
+			}
+			qdx_tx_batch_add(&batch, record);
 			qdx_carrier_put(core, record, true);
-		else
+		} else
 			record->state = QDX_QUARANTINED;
 	}
+	qdx_tx_batch_complete(&batch);
 	dev_info(core->qdx->dev, "core %u carriers: published=%lld returned=%lld faults=%lld dropped=%lld%s\n",
 		 core->id, atomic64_read(&io->published), atomic64_read(&io->returned),
 		 atomic64_read(&io->faults), atomic64_read(&io->dropped),

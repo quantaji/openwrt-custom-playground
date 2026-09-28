@@ -1,0 +1,373 @@
+From: Codex
+Subject: [PATCH] net: sched: expose current owner state and committed structure
+
+Expose optional native owner replay and independent device-stage capability.
+Notify committed qdisc/STAB and TCX occupancy changes without a packet hook.
+The original native algorithms and unsupported-device behavior remain intact.
+
+Signed-off-by: Codex
+---
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index adb821e..35af649 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -952,6 +952,8 @@ enum tc_setup_type {
+ 	TC_SETUP_QDISC_FIFO,
+ 	TC_SETUP_QDISC_HTB,
+ 	TC_SETUP_ACT,
++	TC_SETUP_QDISC_CODEL,
++	TC_SETUP_QDISC_FQ_CODEL,
+ };
+ 
+ /* These structures hold the attributes of bpf state that are being passed
+@@ -3196,6 +3198,7 @@ enum netdev_cmd {
+ 	NETDEV_OFFLOAD_XSTATS_REPORT_USED,
+ 	NETDEV_OFFLOAD_XSTATS_REPORT_DELTA,
+ 	NETDEV_XDP_FEAT_CHANGE,
++	NETDEV_CHANGE_TC,
+ };
+ const char *netdev_cmd_to_name(enum netdev_cmd cmd);
+ 
+@@ -3216,6 +3219,15 @@ struct netdev_notifier_info {
+ 	struct netlink_ext_ack	*extack;
+ };
+ 
++/* Committed processing changes; listeners cannot veto the native mutation. */
++#define NETDEV_TC_INGRESS BIT(0)
++#define NETDEV_TC_EGRESS  BIT(1)
++
++struct netdev_notifier_tc_info {
++	struct netdev_notifier_info info;
++	u8 directions;
++};
++
+ struct netdev_notifier_info_ext {
+ 	struct netdev_notifier_info info; /* must be first */
+ 	union {
+@@ -3305,6 +3317,17 @@ int call_netdevice_notifiers(unsigned long val, struct net_device *dev);
+ int call_netdevice_notifiers_info(unsigned long val,
+ 				  struct netdev_notifier_info *info);
+ 
++/* RTNL; the native owner has committed the change and still holds its objects. */
++static inline void netdev_tc_change(struct net_device *dev, u8 directions)
++{
++	struct netdev_notifier_tc_info change = {
++		.info.dev = dev,
++		.directions = directions,
++	};
++
++	call_netdevice_notifiers_info(NETDEV_CHANGE_TC, &change.info);
++}
++
+ #define for_each_netdev(net, d)		\
+ 		list_for_each_entry(d, &(net)->dev_base_head, dev_list)
+ #define for_each_netdev_reverse(net, d)	\
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index 99ac747..f8fe4ea 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -821,6 +821,15 @@ struct tc_cookie {
+ 	struct rcu_head rcu;
+ };
+ 
++/* All pointers are borrowed under RTNL for this call only. A statistics source
++ * acquires its own lifetime from hw_stats; it must not retain this slot address.
++ */
++struct tc_qdisc_offload_owner {
++	struct Qdisc *sch;
++	unsigned long class;
++	struct gnet_stats_hw **hw_stats;
++};
++
+ struct tc_qopt_offload_stats {
+ 	struct gnet_stats_basic_sync *bstats;
+ 	struct gnet_stats_queue *qstats;
+diff --git a/include/net/pkt_sched.h b/include/net/pkt_sched.h
+index 8a75c73..94742de 100644
+--- a/include/net/pkt_sched.h
++++ b/include/net/pkt_sched.h
+@@ -148,6 +148,11 @@ struct tc_query_caps_base {
+ 	void *caps;
+ };
+ 
++/* The device has a separate queue stage; native software queues still run. */
++struct tc_qdisc_caps {
++	bool device_stage;
++};
++
+ struct tc_cbs_qopt_offload {
+ 	u8 enable;
+ 	s32 queue;
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index 059eb6c..d252c12 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -21,6 +21,7 @@
+ #include <net/flow_offload.h>
+ #include <linux/xarray.h>
+ 
++struct gnet_stats_hw;
+ struct Qdisc_ops;
+ struct qdisc_walker;
+ struct tcf_walker;
+@@ -275,6 +276,11 @@ struct Qdisc_class_ops {
+ 					struct sk_buff *skb, struct tcmsg*);
+ 	int			(*dump_stats)(struct Qdisc *, unsigned long,
+ 					struct gnet_dump *);
++	int (*offload_replay)(struct Qdisc *sch, unsigned long cl,
++			      flow_setup_cb_t *cb, void *cb_priv,
++			      struct netlink_ext_ack *extack);
++	/* RTNL; queue == U16_MAX removes this actual class mapping. */
++	int (*offload_queue)(struct Qdisc *sch, unsigned long cl, u16 queue);
+ };
+ 
+ /* Qdisc_class_ops flag values */
+@@ -305,6 +311,8 @@ struct Qdisc_ops {
+ 					  struct nlattr *arg,
+ 					  struct netlink_ext_ack *extack);
+ 	void			(*attach)(struct Qdisc *sch);
++	int (*offload_replay)(struct Qdisc *sch, flow_setup_cb_t *cb,
++			      void *cb_priv, struct netlink_ext_ack *extack);
+ 	int			(*change_tx_queue_len)(struct Qdisc *, unsigned int);
+ 	void			(*change_real_num_tx)(struct Qdisc *sch,
+ 						      unsigned int new_real_tx);
+@@ -490,6 +498,11 @@ struct tcf_block {
+ 
+ struct tcf_block *tcf_block_lookup(struct net *net, u32 block_index);
+ 
++int qdisc_offload_replay(struct Qdisc *sch, unsigned long cl,
++			 flow_setup_cb_t *cb, void *cb_priv,
++			 struct netlink_ext_ack *extack);
++void qdisc_offload_change(struct Qdisc *sch);
++
+ static inline bool lockdep_tcf_chain_is_locked(struct tcf_chain *chain)
+ {
+ 	return lockdep_is_held(&chain->filter_chain_lock);
+diff --git a/kernel/bpf/tcx.c b/kernel/bpf/tcx.c
+index efd987e..8fd2ee3 100644
+--- a/kernel/bpf/tcx.c
++++ b/kernel/bpf/tcx.c
+@@ -7,6 +7,14 @@
+ 
+ #include <net/tcx.h>
+ 
++static void tcx_notify_change(struct net_device *dev, bool ingress,
++			      bool old_active, struct bpf_mprog_entry *entry)
++{
++	if (old_active != (entry && bpf_mprog_total(entry)))
++		netdev_tc_change(dev, ingress ? NETDEV_TC_INGRESS : NETDEV_TC_EGRESS);
++}
++
++
+ int tcx_prog_attach(const union bpf_attr *attr, struct bpf_prog *prog)
+ {
+ 	bool created, ingress = attr->attach_type == BPF_TCX_INGRESS;
+@@ -14,6 +22,7 @@ int tcx_prog_attach(const union bpf_attr *attr, struct bpf_prog *prog)
+ 	struct bpf_mprog_entry *entry, *entry_new;
+ 	struct bpf_prog *replace_prog = NULL;
+ 	struct net_device *dev;
++	bool old_active;
+ 	int ret;
+ 
+ 	rtnl_lock();
+@@ -36,6 +45,7 @@ int tcx_prog_attach(const union bpf_attr *attr, struct bpf_prog *prog)
+ 		ret = -ENOMEM;
+ 		goto out;
+ 	}
++	old_active = bpf_mprog_total(entry);
+ 	ret = bpf_mprog_attach(entry, &entry_new, prog, NULL, replace_prog,
+ 			       attr->attach_flags, attr->relative_fd,
+ 			       attr->expected_revision);
+@@ -45,6 +55,7 @@ int tcx_prog_attach(const union bpf_attr *attr, struct bpf_prog *prog)
+ 			tcx_entry_sync();
+ 			tcx_skeys_inc(ingress);
+ 		}
++		tcx_notify_change(dev, ingress, old_active, entry_new);
+ 		bpf_mprog_commit(entry);
+ 	} else if (created) {
+ 		tcx_entry_free(entry);
+@@ -62,6 +73,7 @@ int tcx_prog_detach(const union bpf_attr *attr, struct bpf_prog *prog)
+ 	struct net *net = current->nsproxy->net_ns;
+ 	struct bpf_mprog_entry *entry, *entry_new;
+ 	struct net_device *dev;
++	bool old_active;
+ 	int ret;
+ 
+ 	rtnl_lock();
+@@ -75,6 +87,7 @@ int tcx_prog_detach(const union bpf_attr *attr, struct bpf_prog *prog)
+ 		ret = -ENOENT;
+ 		goto out;
+ 	}
++	old_active = bpf_mprog_total(entry);
+ 	ret = bpf_mprog_detach(entry, &entry_new, prog, NULL, attr->attach_flags,
+ 			       attr->relative_fd, attr->expected_revision);
+ 	if (!ret) {
+@@ -83,6 +96,7 @@ int tcx_prog_detach(const union bpf_attr *attr, struct bpf_prog *prog)
+ 		tcx_entry_update(dev, entry_new, ingress);
+ 		tcx_entry_sync();
+ 		tcx_skeys_dec(ingress);
++		tcx_notify_change(dev, ingress, old_active, entry_new);
+ 		bpf_mprog_commit(entry);
+ 		if (!entry_new)
+ 			tcx_entry_free(entry);
+@@ -98,16 +112,18 @@ void tcx_uninstall(struct net_device *dev, bool ingress)
+ 	struct bpf_tuple tuple = {};
+ 	struct bpf_mprog_fp *fp;
+ 	struct bpf_mprog_cp *cp;
+-	bool active;
++	bool active, old_active;
+ 
+ 	entry = tcx_entry_fetch(dev, ingress);
+ 	if (!entry)
+ 		return;
++	old_active = bpf_mprog_total(entry);
+ 	active = tcx_entry(entry)->miniq_active;
+ 	if (active)
+ 		bpf_mprog_clear_all(entry, &entry_new);
+ 	tcx_entry_update(dev, entry_new, ingress);
+ 	tcx_entry_sync();
++	tcx_notify_change(dev, ingress, old_active, entry_new);
+ 	bpf_mprog_foreach_tuple(entry, fp, cp, tuple) {
+ 		if (tuple.link)
+ 			tcx_link(tuple.link)->dev = NULL;
+@@ -145,12 +161,14 @@ static int tcx_link_prog_attach(struct bpf_link *link, u32 flags, u32 id_or_fd,
+ 	bool created, ingress = link->attach_type == BPF_TCX_INGRESS;
+ 	struct bpf_mprog_entry *entry, *entry_new;
+ 	struct net_device *dev = tcx->dev;
++	bool old_active;
+ 	int ret;
+ 
+ 	ASSERT_RTNL();
+ 	entry = tcx_entry_fetch_or_create(dev, ingress, &created);
+ 	if (!entry)
+ 		return -ENOMEM;
++	old_active = bpf_mprog_total(entry);
+ 	ret = bpf_mprog_attach(entry, &entry_new, link->prog, link, NULL, flags,
+ 			       id_or_fd, revision);
+ 	if (!ret) {
+@@ -159,6 +177,7 @@ static int tcx_link_prog_attach(struct bpf_link *link, u32 flags, u32 id_or_fd,
+ 			tcx_entry_sync();
+ 			tcx_skeys_inc(ingress);
+ 		}
++		tcx_notify_change(dev, ingress, old_active, entry_new);
+ 		bpf_mprog_commit(entry);
+ 	} else if (created) {
+ 		tcx_entry_free(entry);
+@@ -172,6 +191,7 @@ static void tcx_link_release(struct bpf_link *link)
+ 	bool ingress = link->attach_type == BPF_TCX_INGRESS;
+ 	struct bpf_mprog_entry *entry, *entry_new;
+ 	struct net_device *dev;
++	bool old_active;
+ 	int ret = 0;
+ 
+ 	rtnl_lock();
+@@ -183,6 +203,7 @@ static void tcx_link_release(struct bpf_link *link)
+ 		ret = -ENOENT;
+ 		goto out;
+ 	}
++	old_active = bpf_mprog_total(entry);
+ 	ret = bpf_mprog_detach(entry, &entry_new, link->prog, link, 0, 0, 0);
+ 	if (!ret) {
+ 		if (!tcx_entry_is_active(entry_new))
+@@ -190,6 +211,7 @@ static void tcx_link_release(struct bpf_link *link)
+ 		tcx_entry_update(dev, entry_new, ingress);
+ 		tcx_entry_sync();
+ 		tcx_skeys_dec(ingress);
++		tcx_notify_change(dev, ingress, old_active, entry_new);
+ 		bpf_mprog_commit(entry);
+ 		if (!entry_new)
+ 			tcx_entry_free(entry);
+diff --git a/net/core/dev.c b/net/core/dev.c
+index a83083e..d5c5c78 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -1867,7 +1867,7 @@ const char *netdev_cmd_to_name(enum netdev_cmd cmd)
+ 	N(SVLAN_FILTER_PUSH_INFO) N(SVLAN_FILTER_DROP_INFO)
+ 	N(PRE_CHANGEADDR) N(OFFLOAD_XSTATS_ENABLE) N(OFFLOAD_XSTATS_DISABLE)
+ 	N(OFFLOAD_XSTATS_REPORT_USED) N(OFFLOAD_XSTATS_REPORT_DELTA)
+-	N(XDP_FEAT_CHANGE)
++	N(XDP_FEAT_CHANGE) N(CHANGE_TC)
+ 	}
+ #undef N
+ 	return "UNKNOWN_NETDEV_EVENT";
+diff --git a/net/sched/sch_api.c b/net/sched/sch_api.c
+index f56b18c..dfe993a 100644
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@ -813,6 +813,35 @@ void qdisc_tree_reduce_backlog(struct Qdisc *sch, int n, int len)
+ }
+ EXPORT_SYMBOL(qdisc_tree_reduce_backlog);
+ 
++int qdisc_offload_replay(struct Qdisc *sch, unsigned long cl,
++			 flow_setup_cb_t *cb, void *cb_priv,
++			 struct netlink_ext_ack *extack)
++{
++	ASSERT_RTNL();
++	if (cl) {
++		const struct Qdisc_class_ops *ops = sch->ops->cl_ops;
++
++		if (!ops || !ops->offload_replay)
++			return -EOPNOTSUPP;
++		return ops->offload_replay(sch, cl, cb, cb_priv, extack);
++	}
++	if (!sch->ops->offload_replay)
++		return -EOPNOTSUPP;
++	return sch->ops->offload_replay(sch, cb, cb_priv, extack);
++}
++EXPORT_SYMBOL_GPL(qdisc_offload_replay);
++
++void qdisc_offload_change(struct Qdisc *sch)
++{
++	/* The ingress attachment can own both clsact directions. */
++	u8 directions = NETDEV_TC_EGRESS;
++
++	if (sch->flags & TCQ_F_INGRESS)
++		directions |= NETDEV_TC_INGRESS;
++	netdev_tc_change(qdisc_dev(sch), directions);
++}
++EXPORT_SYMBOL_GPL(qdisc_offload_change);
++
+ int qdisc_offload_dump_helper(struct Qdisc *sch, enum tc_setup_type type,
+ 			      void *type_data)
+ {
+@@ -1144,6 +1173,7 @@ static int qdisc_graft(struct net_device *dev, struct Qdisc *parent,
+ 			 * pointer(s) in mini_qdisc_pair_swap().
+ 			 */
+ 			qdisc_notify(net, skb, n, classid, old, new, extack);
++			netdev_tc_change(dev, NETDEV_TC_INGRESS | NETDEV_TC_EGRESS);
+ 			qdisc_destroy(old);
+ 
+ 			dev_graft_qdisc(dev_queue, new);
+@@ -1155,6 +1185,7 @@ skip:
+ 			if (new && !new->ops->attach)
+ 				qdisc_refcount_inc(new);
+ 			rcu_assign_pointer(dev->qdisc, new ? : &noop_qdisc);
++			netdev_tc_change(dev, NETDEV_TC_EGRESS);
+ 
+ 			notify_and_destroy(net, skb, n, classid, old, new, extack);
+ 
+@@ -1196,6 +1227,7 @@ skip:
+ 		err = cops->graft(parent, cl, new, &old, extack);
+ 		if (err)
+ 			return err;
++		qdisc_offload_change(parent);
+ 		notify_and_destroy(net, skb, n, classid, old, new, extack);
+ 	}
+ 	return 0;
+@@ -1381,6 +1413,7 @@ static int qdisc_change(struct Qdisc *sch, struct nlattr **tca,
+ 		err = sch->ops->change(sch, tca[TCA_OPTIONS], extack);
+ 		if (err)
+ 			return err;
++		qdisc_offload_change(sch);
+ 	}
+ 
+ 	if (tca[TCA_STAB]) {
+@@ -1391,6 +1424,8 @@ static int qdisc_change(struct Qdisc *sch, struct nlattr **tca,
+ 
+ 	ostab = rtnl_dereference(sch->stab);
+ 	rcu_assign_pointer(sch->stab, stab);
++	if (ostab != stab)
++		qdisc_offload_change(sch);
+ 	qdisc_put_stab(ostab);
+ 
+ 	if (tca[TCA_RATE]) {

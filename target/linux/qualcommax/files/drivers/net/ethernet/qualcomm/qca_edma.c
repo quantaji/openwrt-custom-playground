@@ -16,8 +16,16 @@
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/reset.h>
+#include <linux/qdx/flow.h>
+#include <linux/refcount.h>
+#include <linux/rtnetlink.h>
 #include <linux/version.h>
+#include <net/netfilter/nf_flow_table.h>
+#include <net/pkt_cls.h>
 #include "qca_edma.h"
+
+static void edma_tx_retry(void *context);
+static void edma_txdesc_drain(struct edma_priv *priv, struct edma_ring *ring);
 
 static void edma_irq_disable_all(struct edma_priv *priv)
 {
@@ -163,16 +171,8 @@ static int edma_tx_ring_alloc(struct edma_priv *priv, struct edma_ring *ring,
 	if (ret)
 		return ret;
 
-	ring->skb_store = kcalloc(count, sizeof(struct sk_buff *), GFP_KERNEL);
-	ring->dma_store = kcalloc(count, sizeof(*ring->dma_store), GFP_KERNEL);
-	ring->length_store = kcalloc(count, sizeof(*ring->length_store), GFP_KERNEL);
-	if (!ring->skb_store || !ring->dma_store || !ring->length_store) {
-		kfree(ring->skb_store);
-		kfree(ring->dma_store);
-		kfree(ring->length_store);
-		ring->skb_store = NULL;
-		ring->dma_store = NULL;
-		ring->length_store = NULL;
+	ring->tx = kcalloc(count, sizeof(*ring->tx), GFP_KERNEL);
+	if (!ring->tx) {
 		dma_free_coherent(&priv->pdev->dev, count * desc_size,
 				  ring->desc, ring->dma);
 		ring->desc = NULL;
@@ -216,23 +216,9 @@ static void edma_ring_free(struct edma_priv *priv, struct edma_ring *ring,
 static void edma_tx_ring_free(struct edma_priv *priv, struct edma_ring *ring,
 			      int desc_size)
 {
-	int i;
-
-	if (ring->skb_store) {
-		for (i = 0; i < ring->count; i++) {
-			if (!ring->skb_store[i])
-				continue;
-			dma_unmap_single(&priv->pdev->dev, ring->dma_store[i],
-					 ring->length_store[i], DMA_TO_DEVICE);
-			dev_kfree_skb_any(ring->skb_store[i]);
-		}
-		kfree(ring->dma_store);
-		kfree(ring->length_store);
-		ring->dma_store = NULL;
-		ring->length_store = NULL;
-		kfree(ring->skb_store);
-		ring->skb_store = NULL;
-	}
+	edma_txdesc_drain(priv, ring);
+	kfree(ring->tx);
+	ring->tx = NULL;
 
 	edma_ring_free(priv, ring, desc_size);
 }
@@ -328,15 +314,17 @@ static bool edma_rx_page_take(struct edma_priv *priv, struct page *page,
 }
 
 /* Native and firmware returns share one completion side of conduit BQL. */
-static void edma_tx_complete(void *context, unsigned int packets,
+static void edma_tx_complete(void *context, struct netdev_queue *queue,
+			     unsigned int packets,
 			     unsigned int bytes)
 {
 	struct edma_priv *priv = context;
 
 	spin_lock_bh(&priv->completion_lock);
-	netdev_tx_completed_queue(netdev_get_tx_queue(priv->netdev, 0),
-				  packets, bytes);
+	if (packets)
+		netdev_tx_completed_queue(queue, packets, bytes);
 	spin_unlock_bh(&priv->completion_lock);
+	edma_tx_retry(priv);
 }
 
 static u32 edma_clean_tx(struct edma_priv *priv, struct edma_ring *txcmpl_ring,
@@ -347,9 +335,9 @@ static u32 edma_clean_tx(struct edma_priv *priv, struct edma_ring *txcmpl_ring,
 	struct edma_txcmpl *txcmpl;
 	u32 cleaned = 0, packets = 0, bytes = 0;
 	u16 prod, cons;
-	struct sk_buff *skb;
-	u32 val, len, idx;
-	dma_addr_t dma;
+	struct edma_tx_slot slot;
+	struct netdev_queue *queue = NULL;
+	u32 val, idx;
 
 	regmap_read(priv->regmap,
 		    EDMA_REG_TXCMPL_PROD_IDX(soc->txcmpl_base,
@@ -362,6 +350,8 @@ static u32 edma_clean_tx(struct edma_priv *priv, struct edma_ring *txcmpl_ring,
 					     soc->txcmpl_ring),
 		    &val);
 	cons = val & EDMA_TXCMPL_CONS_IDX_MASK;
+	/* Observe descriptor contents after the device's producer publication. */
+	dma_rmb();
 
 	while (cons != prod && cleaned < budget) {
 		txcmpl = EDMA_TXCMPL_DESC(txcmpl_ring, cons);
@@ -372,24 +362,27 @@ static u32 edma_clean_tx(struct edma_priv *priv, struct edma_ring *txcmpl_ring,
 			goto next;
 		}
 		spin_lock_bh(&priv->tx_lock);
-		skb = priv->txdesc_ring.skb_store[idx];
-		len = priv->txdesc_ring.length_store[idx];
-		dma = priv->txdesc_ring.dma_store[idx];
-		priv->txdesc_ring.skb_store[idx] = NULL;
-		priv->txdesc_ring.length_store[idx] = 0;
+		slot = priv->txdesc_ring.tx[idx];
+		memset(&priv->txdesc_ring.tx[idx], 0, sizeof(slot));
 		spin_unlock_bh(&priv->tx_lock);
 
-		if (unlikely(!skb)) {
+		if (unlikely(!slot.skb)) {
 			dev_warn(&pdev->dev,
 				 "invalid skb: cons:%u prod:%u status %x\n",
 				 cons, prod, txcmpl->status);
 			goto next;
 		}
 
-		dma_unmap_single(&pdev->dev, dma, len, DMA_TO_DEVICE);
+		dma_unmap_single(&pdev->dev, slot.dma, slot.mapped, DMA_TO_DEVICE);
+		if (queue && queue != slot.queue) {
+			edma_tx_complete(priv, queue, packets, bytes);
+			packets = 0;
+			bytes = 0;
+		}
+		queue = slot.queue;
 		packets++;
-		bytes += len - EDMA_TX_PREHDR_SIZE;
-		napi_consume_skb(skb, budget);
+		bytes += slot.bytes;
+		napi_consume_skb(slot.skb, budget);
 
 next:
 		if (++cons == txcmpl_ring->count)
@@ -401,14 +394,13 @@ next:
 	if (cleaned == 0)
 		return 0;
 
-	edma_tx_complete(priv, packets, bytes);
-
 	/* Ensure all TX completions are processed before updating cons idx */
 	wmb();
 	regmap_write(priv->regmap,
 		     EDMA_REG_TXCMPL_CONS_IDX(soc->txcmpl_base,
 					      soc->txcmpl_ring),
-		     cons);
+			     cons);
+	edma_tx_complete(priv, queue, packets, bytes);
 
 	return cleaned;
 }
@@ -426,7 +418,7 @@ static void edma_receive(void *context, unsigned int port, struct sk_buff *skb,
 		dev_kfree_skb_any(skb);
 		return;
 	}
-	tag->port = port;
+	*tag = (struct dsa_oob_tag_info) { .port = port };
 	skb->protocol = eth_type_trans(skb, priv->netdev);
 	dev_sw_netstats_rx_add(priv->netdev, len);
 	napi_gro_receive(napi, skb);
@@ -514,19 +506,16 @@ next:
 	return done;
 }
 
-static void edma_qdx_wake(void *context)
+/* completion_lock is the sole conduit TX-state lock. Native publication takes
+ * tx_lock below it; PPE selection publication crosses it through tx_gate.
+ */
+static bool edma_native_tx_ready(struct edma_priv *priv, u16 slots)
 {
-	struct edma_priv *priv = context;
 	const struct edma_soc_data *soc = priv->soc;
 	u32 prod, cons;
 	int ret;
 
-	spin_lock_bh(&priv->tx_lock);
-	if (qdx_edma_transport(priv->qdx) != QDX_ETH_NATIVE ||
-	    !READ_ONCE(priv->native_ready) || !priv->napi_active ||
-	    !netif_running(priv->netdev) ||
-	    !netif_carrier_ok(priv->netdev))
-		goto out;
+	spin_lock(&priv->tx_lock);
 	ret = regmap_read(priv->regmap,
 			  EDMA_REG_TXDESC_PROD_IDX(soc->txdesc_ring), &prod);
 	if (ret)
@@ -537,11 +526,159 @@ static void edma_qdx_wake(void *context)
 		goto out;
 	prod &= EDMA_TXDESC_PROD_IDX_MASK;
 	cons &= EDMA_TXDESC_CONS_IDX_MASK;
-	if (((cons - prod - 1) & (priv->txdesc_ring.count - 1)) >
-	    EDMA_TX_RING_THRESH)
-		netif_wake_queue(priv->netdev);
+	if (prod >= priv->txdesc_ring.count || cons >= priv->txdesc_ring.count) {
+		ret = -EIO;
+		goto out;
+	}
+	ret = ((cons - prod - 1) & (priv->txdesc_ring.count - 1)) >= slots &&
+	      !priv->txdesc_ring.tx[prod].skb;
 out:
-	spin_unlock_bh(&priv->tx_lock);
+	spin_unlock(&priv->tx_lock);
+	return ret > 0;
+}
+
+static bool edma_tx_can_run_locked(struct edma_priv *priv,
+				   struct qdx_tx_selection *selection)
+{
+	struct edma_tx_wait *wait = &priv->wait;
+	struct qdx_ready ready;
+
+	if (!priv->tx_admin || priv->detaching || priv->tx_transitions ||
+	    !READ_ONCE(priv->native_ready) || !priv->napi_active ||
+	    !netif_running(priv->netdev) ||
+	    !netif_carrier_ok(priv->netdev))
+		return false;
+	if (wait->reason == EDMA_TX_WAIT_NONE)
+		return true;
+	selection->status = QDX_TX_NATIVE;
+	if (wait->tagged)
+		qdx_edma_resolve(priv->qdx, wait->port, wait->user_queue,
+				 wait->token, wait->disposition, selection);
+	if (selection->status == QDX_TX_HELD)
+		return false;
+	if (selection->status == QDX_TX_RETIRED ||
+	    selection->status == QDX_TX_REFUSED)
+		return true; /* Let ndo_xmit consume this permanently refused packet. */
+	if (selection->status == QDX_TX_READY) {
+		ready = qdx_tx_ready(selection->path, wait->charge);
+		if (ready.status == QDX_CLOSED)
+			return false;
+		if (wait->reason == EDMA_TX_WAIT_DISPOSITION)
+			return true;
+		return ready.status == QDX_ACCEPTED || ready.status == QDX_REFUSED;
+	}
+	if (wait->reason == EDMA_TX_WAIT_DISPOSITION)
+		return true;
+	/* A real native handback makes an old firmware-resource wait irrelevant. */
+	if (wait->status != QDX_TX_NATIVE)
+		return true;
+	return edma_native_tx_ready(priv, wait->native_slots);
+}
+
+static void edma_tx_wait_clear_locked(struct edma_priv *priv)
+{
+	qdx_resource_wait_disarm(&priv->wait.resource);
+	priv->wait.status = QDX_TX_NATIVE;
+	priv->wait.reason = EDMA_TX_WAIT_NONE;
+}
+
+static void edma_tx_retry(void *context)
+{
+	struct edma_priv *priv = context;
+	struct qdx_tx_selection checked = {};
+	struct netdev_queue *queue;
+
+	spin_lock_bh(&priv->completion_lock);
+	queue = priv->wait.queue;
+	if (edma_tx_can_run_locked(priv, &checked)) {
+		edma_tx_wait_clear_locked(priv);
+		netif_tx_wake_queue(queue);
+	}
+	spin_unlock_bh(&priv->completion_lock);
+	qdx_tx_selection_put(&checked);
+}
+
+static void edma_tx_gate(void *context, bool hold)
+{
+	struct edma_priv *priv = context;
+
+	spin_lock_bh(&priv->completion_lock);
+	if (hold) {
+		priv->tx_transitions++;
+		netif_tx_stop_queue(priv->wait.queue);
+	} else if (!WARN_ON_ONCE(!priv->tx_transitions)) {
+		priv->tx_transitions--;
+	}
+	spin_unlock_bh(&priv->completion_lock);
+	if (!hold)
+		edma_tx_retry(priv);
+}
+
+static bool edma_wait_get(void *context)
+{
+	struct edma_priv *priv = context;
+
+	dev_hold(priv->netdev);
+	return true;
+}
+
+static void edma_wait_put(void *context)
+{
+	struct edma_priv *priv = context;
+
+	dev_put(priv->netdev);
+}
+
+/* The failed submission owns no skb or DMA. Stop, then recheck after installing
+ * the actual queue's retained scope. Only one inline retry is permitted.
+ */
+static bool edma_tx_maybe_stop(struct edma_priv *priv,
+		const struct dsa_oob_tag_info *tag, size_t charge,
+		enum edma_tx_wait_reason reason, u16 native_slots, bool inline_retry)
+{
+	struct qdx_tx_selection selected = { .status = QDX_TX_NATIVE }, checked = {};
+	struct edma_tx_wait *wait = &priv->wait;
+	struct qdx_ready ready;
+	bool runnable;
+
+	spin_lock_bh(&priv->completion_lock);
+	edma_tx_wait_clear_locked(priv);
+	wait->reason = reason;
+	wait->tagged = !!tag;
+	wait->charge = charge;
+	wait->native_slots = native_slots;
+	if (tag) {
+		wait->port = tag->port;
+		wait->user_queue = tag->user_queue;
+		wait->token = tag->token;
+		wait->disposition = tag->disposition;
+		qdx_edma_resolve(priv->qdx, wait->port, wait->user_queue,
+				 wait->token, wait->disposition, &selected);
+	}
+	/* Retain queue identity and resource notification, not the execution.
+	 * A saved path reference would prevent its own pending handback.
+	 */
+	wait->status = selected.status;
+	if (reason == EDMA_TX_WAIT_RESOURCE && selected.status == QDX_TX_READY) {
+		ready = qdx_tx_ready(selected.path, charge);
+		if (ready.status == QDX_RESOURCE_WAIT)
+			qdx_tx_wait_arm(selected.path, &wait->resource, ready.resources);
+	}
+	netif_tx_stop_queue(wait->queue);
+	runnable = edma_tx_can_run_locked(priv, &checked);
+	if (runnable) {
+		/* Retain the installed scope until retry drops it; no pointer to the
+		 * rejected skb is retained. A scheduled retry must remain scheduled.
+		 */
+		if (inline_retry)
+			netif_tx_start_queue(wait->queue);
+		else
+			netif_tx_wake_queue(wait->queue);
+	}
+	spin_unlock_bh(&priv->completion_lock);
+	qdx_tx_selection_put(&checked);
+	qdx_tx_selection_put(&selected);
+	return runnable && inline_retry;
 }
 
 static int edma_tx_napi(struct napi_struct *napi, int budget)
@@ -551,7 +688,7 @@ static int edma_tx_napi(struct napi_struct *napi, int budget)
 	const struct edma_soc_data *soc = priv->soc;
 	u32 val;
 
-	edma_qdx_wake(priv);
+	edma_tx_retry(priv);
 
 	if (work < budget) {
 		regmap_read(priv->regmap,
@@ -614,96 +751,85 @@ static int edma_rx_napi(struct napi_struct *napi, int budget)
 }
 
 static netdev_tx_t edma_ring_xmit(struct edma_priv *priv, struct net_device *netdev,
-				  struct sk_buff *skb,
-				  struct edma_ring *txdesc_ring)
+				  struct sk_buff *skb, struct netdev_queue *queue)
 {
 	const struct edma_soc_data *soc = priv->soc;
+	struct edma_ring *ring = &priv->txdesc_ring;
 	struct edma_tx_preheader *txph;
-	struct dsa_oob_tag_info *tag_info;
-	struct edma_txdesc *txdesc;
+	struct dsa_oob_tag_info *tag;
+	struct edma_txdesc *desc;
+	struct edma_tx_slot *slot;
 	u16 prod, cons, next;
-	u16 buf_len, dst_info;
+	u32 value, bytes;
 	dma_addr_t dma;
-	u32 val, idx;
 
 	spin_lock_bh(&priv->tx_lock);
-
-	regmap_read(priv->regmap,
-		    EDMA_REG_TXDESC_PROD_IDX(soc->txdesc_ring),
-		    &val);
-	prod = val & EDMA_TXDESC_PROD_IDX_MASK;
-
-	regmap_read(priv->regmap,
-		    EDMA_REG_TXDESC_CONS_IDX(soc->txdesc_ring),
-		    &val);
-	cons = val & EDMA_TXDESC_CONS_IDX_MASK;
-
-	next = (prod + 1) & (txdesc_ring->count - 1);
-
-	if (next == cons) {
+	if (regmap_read(priv->regmap, EDMA_REG_TXDESC_PROD_IDX(soc->txdesc_ring), &value))
+		goto drop;
+	prod = value & EDMA_TXDESC_PROD_IDX_MASK;
+	if (regmap_read(priv->regmap, EDMA_REG_TXDESC_CONS_IDX(soc->txdesc_ring), &value))
+		goto drop;
+	cons = value & EDMA_TXDESC_CONS_IDX_MASK;
+	if (prod >= ring->count || cons >= ring->count)
+		goto drop;
+	next = (prod + 1) & (ring->count - 1);
+	slot = &ring->tx[prod & (ring->count - 1)];
+	if (next == cons || slot->skb) {
 		spin_unlock_bh(&priv->tx_lock);
 		return NETDEV_TX_BUSY;
 	}
 
-	buf_len = skb_headlen(skb);
-
-	tag_info = skb_ext_find(skb, SKB_EXT_DSA_OOB);
-	if (tag_info)
-		dst_info = (EDMA_DST_PORT_TYPE << 8) |
-			   (tag_info->port & EDMA_DST_PORT_ID_MASK);
-	else
-		dst_info = 0;
-
+	/* Capacity is now reserved by this ring lock. No later branch returns
+	 * BUSY after modifying the caller's frame or its storage.
+	 */
+	if (skb_is_nonlinear(skb) && skb_linearize(skb))
+		goto drop;
+	if (soc->tx_min_size && skb->len < soc->tx_min_size) {
+		if (skb_padto(skb, soc->tx_min_size)) {
+			netdev->stats.tx_dropped++;
+			spin_unlock_bh(&priv->tx_lock);
+			return NETDEV_TX_OK;
+		}
+		skb_put(skb, soc->tx_min_size - skb->len);
+	}
+	if ((skb_cloned(skb) || skb_headroom(skb) < netdev->needed_headroom ||
+	     skb_tailroom(skb) < netdev->needed_tailroom) &&
+	    pskb_expand_head(skb, netdev->needed_headroom, netdev->needed_tailroom, GFP_ATOMIC))
+		goto drop;
+	bytes = skb->len;
+	if (bytes > EDMA_TXDESC_DATA_LENGTH_MASK)
+		goto drop;
+	tag = skb_ext_find(skb, SKB_EXT_DSA_OOB);
 	txph = (struct edma_tx_preheader *)skb_push(skb, EDMA_TX_PREHDR_SIZE);
-	memset((void *)txph, 0, EDMA_TX_PREHDR_SIZE);
-
-	txph->dst_info = dst_info;
-
-	idx = prod & (txdesc_ring->count - 1);
-	if (unlikely(txdesc_ring->skb_store[idx] != NULL)) {
-		skb_pull(skb, EDMA_TX_PREHDR_SIZE);
-		spin_unlock_bh(&priv->tx_lock);
-		return NETDEV_TX_BUSY;
-	}
-
-	txdesc_ring->skb_store[idx] = skb;
-	txph->opaque = idx;
-
-	txdesc = EDMA_TXDESC_DESC(txdesc_ring, prod);
-
+	memset(txph, 0, sizeof(*txph));
+	if (tag)
+		txph->dst_info = cpu_to_le16((EDMA_DST_PORT_TYPE << 8) |
+					   (tag->port & EDMA_DST_PORT_ID_MASK));
+	txph->opaque = cpu_to_le32(prod);
 	dma = dma_map_single(&priv->pdev->dev, skb->data,
-			     buf_len + EDMA_TX_PREHDR_SIZE, DMA_TO_DEVICE);
-	if (dma_mapping_error(&priv->pdev->dev, dma)) {
-		dev_kfree_skb_any(skb);
-		txdesc_ring->skb_store[idx] = NULL;
-		spin_unlock_bh(&priv->tx_lock);
-		return NETDEV_TX_OK;
-	}
-	txdesc_ring->dma_store[idx] = dma;
-	txdesc_ring->length_store[idx] = buf_len + EDMA_TX_PREHDR_SIZE;
-	txdesc->buffer_addr = cpu_to_le32(dma);
-
-	txdesc->word1 = (1 << EDMA_TXDESC_PREHEADER_SHIFT) |
-			((EDMA_TX_PREHDR_SIZE & EDMA_TXDESC_DATA_OFFSET_MASK)
-			 << EDMA_TXDESC_DATA_OFFSET_SHIFT) |
-			(buf_len & EDMA_TXDESC_DATA_LENGTH_MASK);
-
-	prod = (prod + 1) & (txdesc_ring->count - 1);
-
+			     bytes + EDMA_TX_PREHDR_SIZE, DMA_TO_DEVICE);
+	if (dma_mapping_error(&priv->pdev->dev, dma))
+		goto drop;
+	*slot = (struct edma_tx_slot) {
+		.skb = skb, .dma = dma, .mapped = bytes + EDMA_TX_PREHDR_SIZE,
+		.bytes = bytes, .queue = queue,
+	};
+	desc = EDMA_TXDESC_DESC(ring, prod);
+	desc->buffer_addr = cpu_to_le32(dma);
+	desc->word1 = cpu_to_le32((1 << EDMA_TXDESC_PREHEADER_SHIFT) |
+				(EDMA_TX_PREHDR_SIZE << EDMA_TXDESC_DATA_OFFSET_SHIFT) |
+				bytes);
 	skb_tx_timestamp(skb);
-	dev_sw_netstats_tx_add(netdev, 1, buf_len);
-	netdev_tx_sent_queue(netdev_get_tx_queue(netdev, 0), buf_len);
-
-	/* Ensure descriptor writes are visible before updating prod idx */
+	dev_sw_netstats_tx_add(netdev, 1, bytes);
+	netdev_tx_sent_queue(queue, bytes);
+	/* Publish the initialized descriptor only after its retained TX record. */
 	wmb();
-	regmap_write(priv->regmap,
-		     EDMA_REG_TXDESC_PROD_IDX(soc->txdesc_ring),
-		     prod & EDMA_TXDESC_PROD_IDX_MASK);
-
-	if (((cons - prod - 1) & (txdesc_ring->count - 1)) <
-	    EDMA_TX_RING_THRESH)
-		netif_stop_queue(netdev);
-
+	regmap_write(priv->regmap, EDMA_REG_TXDESC_PROD_IDX(soc->txdesc_ring), next);
+	spin_unlock_bh(&priv->tx_lock);
+	return NETDEV_TX_OK;
+drop:
+	netdev->stats.tx_dropped++;
+	dev_kfree_skb_any(skb);
 	spin_unlock_bh(&priv->tx_lock);
 	return NETDEV_TX_OK;
 }
@@ -734,32 +860,34 @@ static void edma_rx_ring_free(struct edma_priv *priv, struct edma_ring *ring,
 /* Reset/stop has ended native access. Indices omit prefetched TX packets. */
 static void edma_txdesc_drain(struct edma_priv *priv, struct edma_ring *ring)
 {
+	struct netdev_queue *queue = NULL;
 	u32 bytes = 0, packets = 0;
 	unsigned int i;
 
-	if (!ring->skb_store)
+	if (!ring->tx)
 		return;
 	for (i = 0; i < ring->count; i++) {
-		struct sk_buff *skb;
-		dma_addr_t dma;
-		u32 length;
+		struct edma_tx_slot slot;
 
 		spin_lock_bh(&priv->tx_lock);
-		skb = ring->skb_store[i];
-		dma = ring->dma_store[i];
-		length = ring->length_store[i];
-		ring->skb_store[i] = NULL;
-		ring->length_store[i] = 0;
+		slot = ring->tx[i];
+		memset(&ring->tx[i], 0, sizeof(slot));
 		spin_unlock_bh(&priv->tx_lock);
-		if (!skb)
+		if (!slot.skb)
 			continue;
-		dma_unmap_single(&priv->pdev->dev, dma, length, DMA_TO_DEVICE);
-		bytes += length - EDMA_TX_PREHDR_SIZE;
+		dma_unmap_single(&priv->pdev->dev, slot.dma, slot.mapped, DMA_TO_DEVICE);
+		if (queue && queue != slot.queue) {
+			edma_tx_complete(priv, queue, packets, bytes);
+			packets = 0;
+			bytes = 0;
+		}
+		queue = slot.queue;
+		bytes += slot.bytes;
 		packets++;
-		dev_kfree_skb_any(skb);
+		dev_kfree_skb_any(slot.skb);
 	}
-	if (packets && priv->netdev)
-		edma_tx_complete(priv, packets, bytes);
+	if (packets)
+		edma_tx_complete(priv, queue, packets, bytes);
 }
 
 static int edma_rings_alloc(struct edma_priv *priv)
@@ -800,8 +928,6 @@ err_txcmpl:
 
 static void edma_rings_drain(struct edma_priv *priv)
 {
-	edma_txdesc_drain(priv, &priv->txdesc_ring);
-
 	edma_tx_ring_free(priv, &priv->txdesc_ring, sizeof(struct edma_txdesc));
 	edma_ring_free(priv, &priv->txcmpl_ring, sizeof(struct edma_txcmpl));
 	edma_rx_ring_free(priv, &priv->rxfill_ring,
@@ -1047,42 +1173,17 @@ static void edma_get_ringparam(struct net_device *netdev,
 	ring->rx_pending = priv->rx_entries;
 }
 
-static void edma_get_strings(struct net_device *netdev, u32 set, u8 *data)
-{
-	if (set == ETH_SS_STATS)
-		ethtool_puts(&data, "nss_transport");
-}
-
-static int edma_get_sset_count(struct net_device *netdev, int set)
-{
-	return set == ETH_SS_STATS ? 1 : -EOPNOTSUPP;
-}
-
-static void edma_get_ethtool_stats(struct net_device *netdev,
-				   struct ethtool_stats *stats, u64 *data)
-{
-	struct edma_priv *priv = netdev_priv(netdev);
-
-	data[0] = qdx_edma_transport(priv->qdx);
-	if (data[0] == QDX_ETH_NATIVE && !READ_ONCE(priv->native_ready))
-		data[0] = QDX_ETH_UNAVAILABLE;
-}
-
 static const struct ethtool_ops edma_ethtool_ops = {
 	.get_drvinfo = edma_get_drvinfo,
 	.get_link = ethtool_op_get_link,
 	.get_ringparam = edma_get_ringparam,
-	.get_strings = edma_get_strings,
-	.get_sset_count = edma_get_sset_count,
-	.get_ethtool_stats = edma_get_ethtool_stats,
 };
 
 static int edma_ndo_open(struct net_device *netdev)
 {
 	struct edma_priv *priv = netdev_priv(netdev);
-	enum qdx_eth_transport transport = qdx_edma_transport(priv->qdx);
 
-	if (transport == QDX_ETH_NATIVE && !priv->native_ready)
+	if (!priv->native_ready)
 		return -EIO;
 	/* Both owners may complete earlier submissions in either live mode. */
 	if (priv->native_ready && !priv->napi_active) {
@@ -1093,10 +1194,10 @@ static int edma_ndo_open(struct net_device *netdev)
 		edma_rx_irq_unmask(priv);
 	}
 	/* Administrative cycles retain outstanding packets and their BQL charges. */
-	if (transport == QDX_ETH_FIRMWARE)
-		netif_start_queue(netdev);
-	else
-		edma_qdx_wake(priv);
+	spin_lock_bh(&priv->completion_lock);
+	priv->tx_admin = true;
+	spin_unlock_bh(&priv->completion_lock);
+	edma_tx_retry(priv);
 	return 0;
 }
 
@@ -1105,11 +1206,12 @@ static int edma_ndo_stop(struct net_device *netdev)
 	struct edma_priv *priv = netdev_priv(netdev);
 	bool active;
 
-	spin_lock_bh(&priv->tx_lock);
+	spin_lock_bh(&priv->completion_lock);
 	active = priv->napi_active;
 	WRITE_ONCE(priv->napi_active, false);
-	netif_stop_queue(netdev);
-	spin_unlock_bh(&priv->tx_lock);
+	priv->tx_admin = false;
+	netif_tx_stop_queue(priv->wait.queue);
+	spin_unlock_bh(&priv->completion_lock);
 	netif_tx_disable(netdev);
 	if (!active)
 		return 0;
@@ -1133,49 +1235,275 @@ static int edma_ndo_change_mtu(struct net_device *netdev, int new_mtu);
 static netdev_tx_t edma_ndo_xmit(struct sk_buff *skb, struct net_device *netdev)
 {
 	struct edma_priv *priv = netdev_priv(netdev);
-	const struct edma_soc_data *soc = priv->soc;
+	struct dsa_oob_tag_info *tag = skb_ext_find(skb, SKB_EXT_DSA_OOB);
+	struct dsa_oob_tag_info saved_tag;
+	struct netdev_queue *queue = netdev_get_tx_queue(netdev, skb_get_queue_mapping(skb));
+	struct qdx_tx_selection selection;
+	enum edma_tx_wait_reason reason;
+	struct qdx_ready ready;
+	struct sk_buff *packet;
+	size_t charge;
+	bool retried = false;
+	bool stop;
+	u16 native_slots;
 	netdev_tx_t ret;
-	u32 nhead, ntail;
 
-	if (qdx_edma_transport(priv->qdx) != QDX_ETH_NATIVE) {
-		struct dsa_oob_tag_info *tag = skb_ext_find(skb, SKB_EXT_DSA_OOB);
-
-		return qdx_ethernet_xmit(priv->qdx, skb, tag ? tag->port : UINT_MAX);
+	if (tag) {
+		saved_tag = *tag;
+		tag = &saved_tag;
 	}
-
-	if (!READ_ONCE(priv->native_ready) || skb->len < ETH_HLEN)
+retry:
+	packet = skb;
+	charge = skb->truesize;
+	memset(&selection, 0, sizeof(selection));
+	selection.status = QDX_TX_NATIVE;
+	reason = EDMA_TX_WAIT_DISPOSITION;
+	spin_lock_bh(&priv->completion_lock);
+	if (!priv->tx_admin || priv->detaching || priv->tx_transitions ||
+	    !priv->native_ready || !priv->napi_active ||
+	    !netif_running(netdev) || !netif_carrier_ok(netdev))
+		goto stopped;
+	edma_tx_wait_clear_locked(priv);
+	if (tag)
+		qdx_edma_resolve(priv->qdx, tag->port, tag->user_queue,
+				 tag->token, tag->disposition, &selection);
+	if (selection.status == QDX_TX_HELD)
+		goto stopped;
+	if (selection.status == QDX_TX_RETIRED ||
+	    selection.status == QDX_TX_REFUSED || skb->len < ETH_HLEN)
 		goto drop;
-
-	if (skb_is_nonlinear(skb) && skb_linearize(skb))
-		goto drop;
-
-	if (soc->tx_min_size && skb->len < soc->tx_min_size) {
-		if (skb_padto(skb, soc->tx_min_size)) {
-			netdev->stats.tx_dropped++;
-			return NETDEV_TX_OK;
+	if (selection.status == QDX_TX_NATIVE) {
+		ret = edma_ring_xmit(priv, netdev, skb, queue);
+		if (ret == NETDEV_TX_OK)
+			goto accepted;
+		reason = EDMA_TX_WAIT_RESOURCE;
+		goto stopped;
+	}
+	/* This SoC requires a complete frame of at least tx_min_size bytes.
+	 * A rejected NSS submission must leave the qdisc's original skb intact.
+	 */
+	if (skb_is_nonlinear(skb) || skb_cloned(skb) ||
+	    skb->len < priv->soc->tx_min_size) {
+		packet = skb_copy_expand(skb, skb_headroom(skb),
+			max_t(unsigned int, skb_tailroom(skb),
+			      priv->soc->tx_min_size > skb->len ?
+			      priv->soc->tx_min_size - skb->len : 0), GFP_ATOMIC);
+		if (!packet)
+			goto drop;
+		if (skb_put_padto(packet, priv->soc->tx_min_size)) {
+			packet = skb; /* skb_put_padto consumed only the temporary copy. */
+			goto drop;
 		}
-		skb->len = soc->tx_min_size;
+		charge = packet->truesize;
 	}
-
-	nhead = netdev->needed_headroom;
-	ntail = netdev->needed_tailroom;
-
-	if ((skb_cloned(skb) || skb_headroom(skb) < nhead ||
-	     skb_tailroom(skb) < ntail) &&
-	    pskb_expand_head(skb, nhead, ntail, GFP_ATOMIC))
+	ready = qdx_tx_ready(selection.path, charge);
+	if (ready.status == QDX_ACCEPTED)
+		ready = qdx_xmit(selection.path, packet, selection.class, queue, packet->len);
+	if (ready.status == QDX_ACCEPTED) {
+		if (packet != skb)
+			dev_consume_skb_any(skb);
+		goto accepted;
+	}
+	if (packet != skb)
+		dev_kfree_skb_any(packet);
+	packet = skb;
+	if (ready.status == QDX_REFUSED)
 		goto drop;
-
-	ret = edma_ring_xmit(priv, netdev, skb, &priv->txdesc_ring);
-	if (ret == NETDEV_TX_BUSY)
-		netif_stop_queue(netdev);
-
-	return ret;
-
+	if (ready.status == QDX_RESOURCE_WAIT)
+		reason = EDMA_TX_WAIT_RESOURCE;
+stopped:
+	spin_unlock_bh(&priv->completion_lock);
+	qdx_tx_selection_put(&selection);
+	if (edma_tx_maybe_stop(priv, tag, charge, reason, 1, !retried)) {
+		retried = true;
+		goto retry;
+	}
+	return NETDEV_TX_BUSY;
 drop:
-	dev_kfree_skb_any(skb);
 	netdev->stats.tx_dropped++;
-
+	dev_kfree_skb_any(skb);
+accepted:
+	/* Check fixed descriptor/carrier needs after publication. The next skb's
+	 * unknown allocation is not guessed; its real byte shortage is recorded
+	 * only if that later submission cannot be admitted.
+	 */
+	reason = EDMA_TX_WAIT_RESOURCE;
+	native_slots = EDMA_TX_RING_THRESH + 1;
+	stop = false;
+	if (selection.status == QDX_TX_NATIVE) {
+		stop = !edma_native_tx_ready(priv, native_slots);
+	} else if (selection.status == QDX_TX_READY) {
+		ready = qdx_tx_ready(selection.path, 0);
+		stop = ready.status == QDX_RESOURCE_WAIT || ready.status == QDX_CLOSED;
+		if (ready.status == QDX_CLOSED)
+			reason = EDMA_TX_WAIT_DISPOSITION;
+	}
+	spin_unlock_bh(&priv->completion_lock);
+	qdx_tx_selection_put(&selection);
+	if (stop)
+		edma_tx_maybe_stop(priv, tag, 0, reason, native_slots, false);
 	return NETDEV_TX_OK;
+}
+
+/* One entry per actual FT block and conduit. The native FT lock protects the
+ * callback's table borrow; cfg serializes optional provider attach and detach.
+ */
+struct edma_ft {
+	refcount_t refs;
+	struct mutex cfg;
+	struct net_device *dev;
+	struct nf_flowtable *table;
+	struct qdx_binding *native;
+	struct qdx_binding *provider;
+	void *attachment;
+	bool closed;
+};
+
+static bool edma_ft_get(void *object)
+{
+	struct edma_ft *entry = object;
+
+	return refcount_inc_not_zero(&entry->refs);
+}
+
+static void edma_ft_put(void *object)
+{
+	struct edma_ft *entry = object;
+
+	if (!refcount_dec_and_test(&entry->refs))
+		return;
+	dev_put(entry->dev);
+	kfree(entry);
+}
+
+static int edma_ft_setup(enum tc_setup_type type, void *data, void *object)
+{
+	struct edma_ft *entry = object;
+	const struct qdx_binding_key key = { .role = QDX_BINDING_FT_PROVIDER };
+	struct flow_cls_offload *cls = data;
+	const struct qdx_flow_ops *ops;
+	struct qdx_binding *provider;
+	int ret = -EOPNOTSUPP;
+
+	mutex_lock(&entry->cfg);
+	if (entry->closed)
+		goto out;
+	if (!entry->provider) {
+		/* CPU refresh naturally retries REPLACE after a missing peer loads.
+		 * Cleanup/statistics for an unoffloaded entry need no new attachment.
+		 */
+		if (type != TC_SETUP_CLSFLOWER || cls->command != FLOW_CLS_REPLACE)
+			goto out;
+		provider = qdx_binding_lookup(&key);
+		if (IS_ERR(provider)) {
+			ret = PTR_ERR(provider);
+			goto out;
+		}
+		if (!provider)
+			goto out;
+		ops = qdx_binding_ops(provider);
+		ret = ops->bind(qdx_binding_owner(provider), entry->native,
+				entry->table, &entry->attachment);
+		if (ret) {
+			qdx_binding_put(provider);
+			goto out;
+		}
+		entry->provider = provider;
+	}
+	ops = qdx_binding_ops(entry->provider);
+	ret = ops->setup(entry->attachment, type, data);
+out:
+	mutex_unlock(&entry->cfg);
+	return ret;
+}
+
+static void edma_ft_release(void *object)
+{
+	struct edma_ft *entry = object;
+	const struct qdx_flow_ops *ops;
+
+	/* Native flow_block write lock excludes every old callback. No wait for
+	 * RTNL-dependent preparation or final hardware retirement is allowed here.
+	 */
+	mutex_lock(&entry->cfg);
+	entry->closed = true;
+	if (entry->provider) {
+		ops = qdx_binding_ops(entry->provider);
+		ops->unbind(entry->attachment);
+		entry->attachment = NULL;
+		qdx_binding_put(entry->provider);
+		entry->provider = NULL;
+	}
+	entry->table = NULL;
+	qdx_binding_withdraw(entry->native);
+	mutex_unlock(&entry->cfg);
+	edma_ft_put(entry); /* Native callback storage; old peer refs may remain. */
+}
+
+static int edma_ndo_setup_tc(struct net_device *netdev, enum tc_setup_type type,
+			     void *data)
+{
+	struct edma_priv *priv = netdev_priv(netdev);
+	struct flow_block_offload *offload = data;
+	struct qdx_binding_key key;
+	struct qdx_owner owner;
+	struct flow_block_cb *cb;
+	struct edma_ft *entry;
+	int ret;
+
+	if (type != TC_SETUP_FT || !offload->nf_flowtable ||
+	    offload->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+		return -EOPNOTSUPP;
+	cb = flow_block_cb_lookup(offload->block, edma_ft_setup, netdev);
+	switch (offload->command) {
+	case FLOW_BLOCK_BIND:
+		if (cb) {
+			flow_block_cb_incref(cb);
+			return 0;
+		}
+		entry = kzalloc_obj(*entry);
+		if (!entry)
+			return -ENOMEM;
+		refcount_set(&entry->refs, 1);
+		mutex_init(&entry->cfg);
+		entry->dev = netdev;
+		dev_hold(netdev);
+		entry->table = offload->nf_flowtable;
+		key = (struct qdx_binding_key) {
+			.dev = netdev, .identity = offload->block, .role = QDX_BINDING_FT,
+		};
+		owner = (struct qdx_owner) {
+			.module = THIS_MODULE, .object = entry,
+			.get = edma_ft_get, .put = edma_ft_put,
+		};
+		entry->native = qdx_binding_publish(&key, &owner, NULL);
+		if (IS_ERR(entry->native)) {
+			ret = PTR_ERR(entry->native);
+			edma_ft_put(entry);
+			return ret;
+		}
+		cb = flow_block_cb_alloc(edma_ft_setup, netdev, entry, edma_ft_release);
+		if (IS_ERR(cb)) {
+			qdx_binding_withdraw(entry->native);
+			edma_ft_put(entry);
+			return PTR_ERR(cb);
+		}
+		flow_block_cb_incref(cb);
+		flow_block_cb_add(cb, offload);
+		list_add_tail(&cb->driver_list, &priv->ft_bindings);
+		qdx_binding_available(entry->native);
+		return 0;
+	case FLOW_BLOCK_UNBIND:
+		if (!cb)
+			return -ENOENT;
+		if (flow_block_cb_decref(cb))
+			return 0;
+		flow_block_cb_remove(cb, offload);
+		list_del(&cb->driver_list);
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
 }
 
 static const struct net_device_ops edma_netdev_ops = {
@@ -1183,6 +1511,7 @@ static const struct net_device_ops edma_netdev_ops = {
 	.ndo_stop = edma_ndo_stop,
 	.ndo_start_xmit = edma_ndo_xmit,
 	.ndo_change_mtu = edma_ndo_change_mtu,
+	.ndo_setup_tc = edma_ndo_setup_tc,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_validate_addr = eth_validate_addr,
 	.ndo_get_stats64 = dev_get_tstats64,
@@ -1385,7 +1714,6 @@ static int edma_qdx_quiesce(void *context, u32 native_rx_entries)
 		ret = edma_hw_init(priv);
 		if (ret)
 			return ret;
-		netdev_tx_reset_queue(netdev_get_tx_queue(priv->netdev, 0));
 		WRITE_ONCE(priv->native_ready, false);
 	}
 
@@ -1520,32 +1848,38 @@ static int edma_qdx_resume_shared(void *context)
 		}
 	}
 	WRITE_ONCE(priv->native_ready, true);
+	spin_lock_bh(&priv->completion_lock);
+	priv->tx_admin = netif_running(priv->netdev);
+	spin_unlock_bh(&priv->completion_lock);
+	edma_tx_retry(priv);
 	return 0;
 }
 
-static int edma_qdx_select(void *context, enum qdx_eth_transport transport)
+static int edma_qdx_map_rx_queue(void *context, u16 queue, bool firmware)
 {
 	struct edma_priv *priv = context;
-	u32 route, value;
+	u32 route, value, reg, shift, mask;
 	int ret;
 
-	if (!priv->shared || !priv->native_ready)
+	if (!priv->native_ready || (firmware && !priv->shared))
 		return -EIO;
-	if (transport == QDX_ETH_NATIVE)
-		route = priv->soc->rxdesc_ring;
-	else if (transport == QDX_ETH_FIRMWARE)
-		route = priv->firmware_rx_ring;
-	else
-		return -EINVAL;
-
-	ret = regmap_update_bits(priv->regmap, EDMA_QID2RID_TABLE_MEM(0),
-				 EDMA_QID2RID_QUEUE0_MASK, route);
+	if (queue >= EDMA_QID2RID_UNICAST_QUEUES)
+		return -ERANGE;
+	/* PPE owns allocation and its affected dequeue hold. EDMA writes only
+	 * this actual queue's four-bit ring field, then verifies the same field.
+	 */
+	reg = EDMA_QID2RID_TABLE_MEM(queue / EDMA_QID2RID_QUEUES_PER_WORD);
+	shift = (queue % EDMA_QID2RID_QUEUES_PER_WORD) * 4;
+	mask = EDMA_QID2RID_QUEUE0_MASK << shift;
+	route = firmware ? priv->firmware_rx_ring : priv->soc->rxdesc_ring;
+	route <<= shift;
+	ret = regmap_update_bits(priv->regmap, reg, mask, route);
 	if (ret)
 		return ret;
-	ret = regmap_read(priv->regmap, EDMA_QID2RID_TABLE_MEM(0), &value);
+	ret = regmap_read(priv->regmap, reg, &value);
 	if (ret)
 		return ret;
-	return (value & EDMA_QID2RID_QUEUE0_MASK) == route ? 0 : -EIO;
+	return (value & mask) == route ? 0 : -EIO;
 }
 
 static int edma_qdx_restore(void *context)
@@ -1584,7 +1918,6 @@ static int edma_qdx_activate(void *context)
 	const struct edma_soc_data *soc = priv->soc;
 	int ret;
 
-	netdev_tx_reset_queue(netdev_get_tx_queue(priv->netdev, 0));
 	if (!netif_running(priv->netdev))
 		return 0;
 	napi_enable(&priv->tx_napi);
@@ -1602,6 +1935,11 @@ static int edma_qdx_activate(void *context)
 	if (ret) {
 		edma_ndo_stop(priv->netdev);
 		WRITE_ONCE(priv->native_ready, false);
+	} else {
+		spin_lock_bh(&priv->completion_lock);
+		priv->tx_admin = true;
+		spin_unlock_bh(&priv->completion_lock);
+		edma_tx_retry(priv);
 	}
 	return ret;
 }
@@ -1610,8 +1948,9 @@ static const struct qdx_edma_ops edma_qdx_ops = {
 	.activate = edma_qdx_activate,
 	.quiesce = edma_qdx_quiesce,
 	.resume_shared = edma_qdx_resume_shared,
-	.select = edma_qdx_select,
-	.wake = edma_qdx_wake,
+	.map_rx_queue = edma_qdx_map_rx_queue,
+	.resource_progress = edma_tx_retry,
+	.tx_gate = edma_tx_gate,
 	.complete_tx = edma_tx_complete,
 	.restore = edma_qdx_restore,
 	.receive = edma_receive,
@@ -1695,10 +2034,20 @@ static int edma_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	priv = netdev_priv(netdev);
+	priv->netdev = netdev;
 	priv->regmap = regmap;
 	priv->rst = rst;
 	spin_lock_init(&priv->tx_lock);
 	spin_lock_init(&priv->completion_lock);
+	INIT_LIST_HEAD(&priv->ft_bindings);
+	INIT_LIST_HEAD(&priv->wait.resource.node);
+	refcount_set(&priv->wait.resource.calls, 0);
+	priv->wait.queue = netdev_get_tx_queue(netdev, 0);
+	priv->wait.resource.owner = (struct qdx_owner) {
+		.module = THIS_MODULE, .object = priv,
+		.get = edma_wait_get, .put = edma_wait_put,
+	};
+	priv->wait.resource.progress = edma_tx_retry;
 	priv->rx_entries = EDMA_RX_RING_SIZE;
 	priv->pdev = pdev;
 	priv->soc = device_get_match_data(dev);
@@ -1764,10 +2113,14 @@ static int edma_probe(struct platform_device *pdev)
 			.tx_min_size = priv->soc->tx_min_size,
 		};
 
+		/* Native preparation takes RTNL before using this backpointer. */
+		rtnl_lock();
 		priv->qdx = qdx_edma_attach(&info);
-		if (IS_ERR(priv->qdx)) {
-			ret = PTR_ERR(priv->qdx);
+		ret = PTR_ERR_OR_ZERO(priv->qdx);
+		if (ret)
 			priv->qdx = NULL;
+		rtnl_unlock();
+		if (ret) {
 			unregister_netdev(netdev);
 			goto err_irq;
 		}
@@ -1788,6 +2141,13 @@ static void edma_remove(struct platform_device *pdev)
 {
 	struct edma_priv *priv = platform_get_drvdata(pdev);
 
+	spin_lock_bh(&priv->completion_lock);
+	priv->detaching = true;
+	netif_tx_stop_queue(priv->wait.queue);
+	edma_tx_wait_clear_locked(priv);
+	spin_unlock_bh(&priv->completion_lock);
+	netif_tx_disable(priv->netdev);
+	qdx_resource_wait_drain(&priv->wait.resource);
 	qdx_edma_detach(priv->qdx);
 	priv->qdx = NULL;
 	unregister_netdev(priv->netdev);

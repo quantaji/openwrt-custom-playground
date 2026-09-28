@@ -1,0 +1,388 @@
+From: Codex
+Subject: [PATCH] net: sched: account an independent device stage
+
+Keep cumulative device observations with their actual native owner.
+Separate source attachment identities prevent late gauges from replacing a
+new source; late counters remain valid until the native sink is closed.
+
+Signed-off-by: Codex
+---
+diff --git a/include/net/gen_stats.h b/include/net/gen_stats.h
+index 7aa2b8e..4047a30 100644
+--- a/include/net/gen_stats.h
++++ b/include/net/gen_stats.h
+@@ -22,6 +22,28 @@ struct gnet_stats_basic_sync {
+ } __aligned(2 * sizeof(u64));
+ 
+ struct net_rate_estimator;
++struct gnet_stats_hw;
++struct gnet_stats_hw_source;
++
++/* Deltas are consumed once; qlen/backlog and APP gauges are current samples. */
++struct gnet_stats_hw_sample {
++	u64 bytes;
++	u64 packets;
++	struct gnet_stats_queue_hw queue;
++	struct gnet_stats_app_hw app;
++};
++
++/* open: RTNL, borrowed native owner slot; returned source owns its lifetime.
++ * update/detach/put: non-sleeping; updates may outlive the native owner.
++ */
++struct gnet_stats_hw_source *
++gnet_stats_hw_source_open(struct gnet_stats_hw **owner);
++void gnet_stats_hw_source_get(struct gnet_stats_hw_source *source);
++void gnet_stats_hw_source_update(struct gnet_stats_hw_source *source,
++				const struct gnet_stats_hw_sample *sample);
++void gnet_stats_hw_source_detach(struct gnet_stats_hw_source *source);
++void gnet_stats_hw_source_put(struct gnet_stats_hw_source *source);
++void gnet_stats_hw_close(struct gnet_stats_hw **owner);
+ 
+ struct gnet_dump {
+ 	spinlock_t *      lock;
+@@ -66,6 +88,7 @@ void gnet_stats_add_queue(struct gnet_stats_queue *qstats,
+ int gnet_stats_copy_app(struct gnet_dump *d, void *st, int len);
+ 
+ int gnet_stats_finish_copy(struct gnet_dump *d);
++int gnet_stats_copy_hw(struct gnet_dump *d, struct gnet_stats_hw *stats);
+ 
+ int gen_new_estimator(struct gnet_stats_basic_sync *bstats,
+ 		      struct gnet_stats_basic_sync __percpu *cpu_bstats,
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+index d252c12..7b9cd55 100644
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -105,6 +105,7 @@ struct Qdisc {
+ 
+ 	struct netdev_queue	*dev_queue;
+ 
++	struct gnet_stats_hw	*hw_stats;
+ 	struct net_rate_estimator __rcu *rate_est;
+ 	struct gnet_stats_basic_sync __percpu *cpu_bstats;
+ 	struct gnet_stats_queue	__percpu *cpu_qstats;
+diff --git a/include/uapi/linux/gen_stats.h b/include/uapi/linux/gen_stats.h
+index 852f234..90b5077 100644
+--- a/include/uapi/linux/gen_stats.h
++++ b/include/uapi/linux/gen_stats.h
+@@ -14,6 +14,8 @@ enum {
+ 	TCA_STATS_PAD,
+ 	TCA_STATS_BASIC_HW,
+ 	TCA_STATS_PKT64,
++	TCA_STATS_QUEUE_HW,
++	TCA_STATS_APP_HW,
+ 	__TCA_STATS_MAX,
+ };
+ #define TCA_STATS_MAX (__TCA_STATS_MAX - 1)
+@@ -64,6 +66,50 @@ struct gnet_stats_queue {
+ 	__u32	overlimits;
+ };
+ 
++/* QUEUE_HW presence identifies an independent device queue stage. Its counters
++ * are not a subset of BASIC/QUEUE, and must not be subtracted from those values.
++ */
++enum {
++	GNET_STATS_HW_ENQUEUE_DROP_PACKETS = 1ULL << 0,
++	GNET_STATS_HW_ENQUEUE_DROP_BYTES   = 1ULL << 1,
++	GNET_STATS_HW_DEQUEUE_DROP_PACKETS = 1ULL << 2,
++	GNET_STATS_HW_DEQUEUE_DROP_BYTES   = 1ULL << 3,
++	GNET_STATS_HW_OVERRUNS             = 1ULL << 4,
++	GNET_STATS_HW_QLEN                = 1ULL << 5,
++	GNET_STATS_HW_BACKLOG             = 1ULL << 6,
++};
++
++struct gnet_stats_queue_hw {
++	__u64 valid;
++	__u64 enqueue_drop_packets;
++	__u64 enqueue_drop_bytes;
++	__u64 dequeue_drop_packets;
++	__u64 dequeue_drop_bytes;
++	__u64 overruns;
++	__u64 qlen;
++	__u64 backlog;
++};
++
++enum {
++	GNET_STATS_HW_NEW_FLOWS    = 1ULL << 0,
++	GNET_STATS_HW_ECN_MARKS    = 1ULL << 1,
++	GNET_STATS_HW_NEW_LIST_LEN = 1ULL << 2,
++	GNET_STATS_HW_OLD_LIST_LEN = 1ULL << 3,
++	GNET_STATS_HW_MAXPACKET    = 1ULL << 4,
++	GNET_STATS_HW_PEAK_DELAY   = 1ULL << 5,
++};
++
++/* Normalized observations, independent of each software algorithm's APP ABI. */
++struct gnet_stats_app_hw {
++	__u64 valid;
++	__u64 new_flows;
++	__u64 ecn_marks;
++	__u64 new_list_len;
++	__u64 old_list_len;
++	__u64 maxpacket;
++	__u64 peak_delay_ns;
++};
++
+ /**
+  * struct gnet_estimator - rate estimator configuration
+  * @interval: sampling period
+diff --git a/net/core/gen_stats.c b/net/core/gen_stats.c
+index b71ccae..2782e31 100644
+--- a/net/core/gen_stats.c
++++ b/net/core/gen_stats.c
+@@ -483,3 +483,185 @@ gnet_stats_finish_copy(struct gnet_dump *d)
+ 	return 0;
+ }
+ EXPORT_SYMBOL(gnet_stats_finish_copy);
++
++
++#define GNET_HW_QUEUE_COUNTERS (GNET_STATS_HW_ENQUEUE_DROP_PACKETS | \
++		GNET_STATS_HW_ENQUEUE_DROP_BYTES | GNET_STATS_HW_DEQUEUE_DROP_PACKETS | \
++		GNET_STATS_HW_DEQUEUE_DROP_BYTES | GNET_STATS_HW_OVERRUNS)
++#define GNET_HW_APP_COUNTERS (GNET_STATS_HW_NEW_FLOWS | GNET_STATS_HW_ECN_MARKS)
++
++struct gnet_stats_hw {
++	refcount_t refs;
++	spinlock_t lock;
++	bool alive;
++	struct gnet_stats_hw_source *active_source;
++	struct gnet_stats_hw_sample totals;
++};
++
++struct gnet_stats_hw_source {
++	refcount_t refs;
++	struct gnet_stats_hw *sink;
++	bool detached;
++};
++
++static void gnet_stats_hw_put(struct gnet_stats_hw *sink)
++{
++	if (refcount_dec_and_test(&sink->refs))
++		kfree(sink);
++}
++
++struct gnet_stats_hw_source *
++gnet_stats_hw_source_open(struct gnet_stats_hw **owner)
++{
++	struct gnet_stats_hw_source *source;
++	struct gnet_stats_hw *sink = *owner;
++	bool new_sink = !sink;
++
++	ASSERT_RTNL();
++	if (new_sink) {
++		sink = kzalloc(sizeof(*sink), GFP_KERNEL);
++		if (!sink)
++			return ERR_PTR(-ENOMEM);
++		refcount_set(&sink->refs, 1);
++		spin_lock_init(&sink->lock);
++		sink->alive = true;
++	}
++	source = kzalloc(sizeof(*source), GFP_KERNEL);
++	if (!source) {
++		if (new_sink)
++			gnet_stats_hw_put(sink);
++		return ERR_PTR(-ENOMEM);
++	}
++	refcount_set(&source->refs, 1);
++	refcount_inc(&sink->refs);
++	source->sink = sink;
++	spin_lock_bh(&sink->lock);
++	sink->active_source = source;
++	sink->totals.queue.valid &= GNET_HW_QUEUE_COUNTERS;
++	sink->totals.app.valid &= GNET_HW_APP_COUNTERS;
++	spin_unlock_bh(&sink->lock);
++	if (new_sink)
++		*owner = sink;
++	return source;
++}
++EXPORT_SYMBOL_GPL(gnet_stats_hw_source_open);
++
++void gnet_stats_hw_source_get(struct gnet_stats_hw_source *source)
++{
++	refcount_inc(&source->refs);
++}
++EXPORT_SYMBOL_GPL(gnet_stats_hw_source_get);
++
++void gnet_stats_hw_source_update(struct gnet_stats_hw_source *source,
++				const struct gnet_stats_hw_sample *sample)
++{
++	struct gnet_stats_hw *sink = source->sink;
++	struct gnet_stats_hw_sample *totals = &sink->totals;
++
++	spin_lock_bh(&sink->lock);
++	if (!sink->alive)
++		goto out;
++	totals->bytes += sample->bytes;
++	totals->packets += sample->packets;
++	if (sample->queue.valid & GNET_STATS_HW_ENQUEUE_DROP_PACKETS)
++		totals->queue.enqueue_drop_packets += sample->queue.enqueue_drop_packets;
++	if (sample->queue.valid & GNET_STATS_HW_ENQUEUE_DROP_BYTES)
++		totals->queue.enqueue_drop_bytes += sample->queue.enqueue_drop_bytes;
++	if (sample->queue.valid & GNET_STATS_HW_DEQUEUE_DROP_PACKETS)
++		totals->queue.dequeue_drop_packets += sample->queue.dequeue_drop_packets;
++	if (sample->queue.valid & GNET_STATS_HW_DEQUEUE_DROP_BYTES)
++		totals->queue.dequeue_drop_bytes += sample->queue.dequeue_drop_bytes;
++	if (sample->queue.valid & GNET_STATS_HW_OVERRUNS)
++		totals->queue.overruns += sample->queue.overruns;
++	totals->queue.valid |= sample->queue.valid & GNET_HW_QUEUE_COUNTERS;
++	if (sample->app.valid & GNET_STATS_HW_NEW_FLOWS)
++		totals->app.new_flows += sample->app.new_flows;
++	if (sample->app.valid & GNET_STATS_HW_ECN_MARKS)
++		totals->app.ecn_marks += sample->app.ecn_marks;
++	totals->app.valid |= sample->app.valid & GNET_HW_APP_COUNTERS;
++	if (source->detached || sink->active_source != source)
++		goto out;
++	totals->queue.qlen = sample->queue.qlen;
++	totals->queue.backlog = sample->queue.backlog;
++	totals->queue.valid = (totals->queue.valid & GNET_HW_QUEUE_COUNTERS) |
++		(sample->queue.valid & (GNET_STATS_HW_QLEN | GNET_STATS_HW_BACKLOG));
++	totals->app.new_list_len = sample->app.new_list_len;
++	totals->app.old_list_len = sample->app.old_list_len;
++	totals->app.maxpacket = sample->app.maxpacket;
++	totals->app.peak_delay_ns = sample->app.peak_delay_ns;
++	totals->app.valid = (totals->app.valid & GNET_HW_APP_COUNTERS) |
++		(sample->app.valid & (GNET_STATS_HW_NEW_LIST_LEN |
++		 GNET_STATS_HW_OLD_LIST_LEN | GNET_STATS_HW_MAXPACKET |
++		 GNET_STATS_HW_PEAK_DELAY));
++out:
++	spin_unlock_bh(&sink->lock);
++}
++EXPORT_SYMBOL_GPL(gnet_stats_hw_source_update);
++
++void gnet_stats_hw_source_detach(struct gnet_stats_hw_source *source)
++{
++	struct gnet_stats_hw *sink = source->sink;
++
++	spin_lock_bh(&sink->lock);
++	source->detached = true;
++	if (sink->active_source == source) {
++		sink->active_source = NULL;
++		sink->totals.queue.valid &= GNET_HW_QUEUE_COUNTERS;
++		sink->totals.app.valid &= GNET_HW_APP_COUNTERS;
++	}
++	spin_unlock_bh(&sink->lock);
++}
++EXPORT_SYMBOL_GPL(gnet_stats_hw_source_detach);
++
++void gnet_stats_hw_source_put(struct gnet_stats_hw_source *source)
++{
++	if (!refcount_dec_and_test(&source->refs))
++		return;
++	gnet_stats_hw_source_detach(source);
++	gnet_stats_hw_put(source->sink);
++	kfree(source);
++}
++EXPORT_SYMBOL_GPL(gnet_stats_hw_source_put);
++
++void gnet_stats_hw_close(struct gnet_stats_hw **owner)
++{
++	struct gnet_stats_hw *sink = xchg(owner, NULL);
++
++	if (!sink)
++		return;
++	spin_lock_bh(&sink->lock);
++	sink->alive = false;
++	sink->active_source = NULL;
++	sink->totals.queue.valid &= GNET_HW_QUEUE_COUNTERS;
++	sink->totals.app.valid &= GNET_HW_APP_COUNTERS;
++	spin_unlock_bh(&sink->lock);
++	gnet_stats_hw_put(sink);
++}
++EXPORT_SYMBOL_GPL(gnet_stats_hw_close);
++
++int gnet_stats_copy_hw(struct gnet_dump *d, struct gnet_stats_hw *stats)
++{
++	struct gnet_stats_basic_sync basic;
++	struct gnet_stats_hw_sample sample;
++
++	if (!stats)
++		return 0;
++	spin_lock_bh(&stats->lock);
++	sample = stats->totals;
++	spin_unlock_bh(&stats->lock);
++	gnet_stats_basic_sync_init(&basic);
++	_bstats_update(&basic, sample.bytes, sample.packets);
++	if (gnet_stats_copy_basic_hw(d, NULL, &basic, false) < 0)
++		return -1;
++	if (!d->tail)
++		return 0;
++	/* Emit the independent-stage marker even before a valid gauge exists. */
++	if (gnet_stats_copy(d, TCA_STATS_QUEUE_HW, &sample.queue,
++			    sizeof(sample.queue), TCA_STATS_PAD) < 0)
++		return -1;
++	if (sample.app.valid)
++		return gnet_stats_copy(d, TCA_STATS_APP_HW, &sample.app,
++				       sizeof(sample.app), TCA_STATS_PAD);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(gnet_stats_copy_hw);
+diff --git a/net/sched/sch_api.c b/net/sched/sch_api.c
+index dfe993a..b6047e8 100644
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@ -988,7 +988,8 @@ static int tc_fill_qdisc(struct sk_buff *skb, struct Qdisc *q, u32 clid,
+ 
+ 	if (gnet_stats_copy_basic(&d, cpu_bstats, &q->bstats, true) < 0 ||
+ 	    gnet_stats_copy_rate_est(&d, &q->rate_est) < 0 ||
+-	    gnet_stats_copy_queue(&d, cpu_qstats, &q->qstats, qlen) < 0)
++	    gnet_stats_copy_queue(&d, cpu_qstats, &q->qstats, qlen) < 0 ||
++	    gnet_stats_copy_hw(&d, q->hw_stats) < 0)
+ 		goto nla_put_failure;
+ 
+ 	if (gnet_stats_finish_copy(&d) < 0)
+@@ -1383,6 +1384,7 @@ err_out4:
+ 	 */
+ 	if (ops->destroy)
+ 		ops->destroy(sch);
++	gnet_stats_hw_close(&sch->hw_stats);
+ 	qdisc_put_stab(rtnl_dereference(sch->stab));
+ err_out3:
+ 	lockdep_unregister_key(&sch->root_lock_key);
+diff --git a/net/sched/sch_generic.c b/net/sched/sch_generic.c
+index 34573c9..6f21e9b 100644
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -1101,6 +1101,7 @@ static void __qdisc_destroy(struct Qdisc *qdisc)
+ 
+ 	if (ops->destroy)
+ 		ops->destroy(qdisc);
++	gnet_stats_hw_close(&qdisc->hw_stats);
+ 
+ 	lockdep_unregister_key(&qdisc->root_lock_key);
+ 	bpf_module_put(ops, ops->owner);
+diff --git a/net/sched/sch_htb.c b/net/sched/sch_htb.c
+index db97fdb..58fe309 100644
+--- a/net/sched/sch_htb.c
++++ b/net/sched/sch_htb.c
+@@ -107,6 +107,7 @@ struct htb_class {
+ 	unsigned int		children;
+ 	struct htb_class	*parent;	/* parent class */
+ 
++	struct gnet_stats_hw	*hw_stats;
+ 	struct net_rate_estimator __rcu *rate_est;
+ 
+ 	/*
+@@ -1350,7 +1351,8 @@ htb_dump_class_stats(struct Qdisc *sch, unsigned long arg, struct gnet_dump *d)
+ 
+ 	if (gnet_stats_copy_basic(d, NULL, &cl->bstats, true) < 0 ||
+ 	    gnet_stats_copy_rate_est(d, &cl->rate_est) < 0 ||
+-	    gnet_stats_copy_queue(d, NULL, &qs, qlen) < 0)
++	    gnet_stats_copy_queue(d, NULL, &qs, qlen) < 0 ||
++	    gnet_stats_copy_hw(d, cl->hw_stats) < 0)
+ 		return -1;
+ 
+ 	return gnet_stats_copy_app(d, &cl->xstats, sizeof(cl->xstats));
+@@ -1605,6 +1607,7 @@ static void htb_destroy_class(struct Qdisc *sch, struct htb_class *cl)
+ 	}
+ 	gen_kill_estimator(&cl->rate_est);
+ 	tcf_block_put(cl->block);
++	gnet_stats_hw_close(&cl->hw_stats);
+ 	kfree(cl);
+ }
+ 
+@@ -2060,6 +2063,7 @@ err_kill_estimator:
+ 	gen_kill_estimator(&cl->rate_est);
+ err_block_put:
+ 	tcf_block_put(cl->block);
++	gnet_stats_hw_close(&cl->hw_stats);
+ 	kfree(cl);
+ failure:
+ 	return err;

@@ -1,0 +1,6 @@
+config QDX_VLAN
+	tristate "QDX VLAN path integration"
+	depends on QDX && VLAN_8021Q
+	help
+	  Interpret native VLAN operations at their actual packet positions.
+	  Create firmware VLAN endpoints only for explicitly requested lowers.

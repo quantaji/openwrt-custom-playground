@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config QDX_TC
+	tristate "Qualcomm NSS native TC device stage"
+	depends on QDX && NET_SCHED && NET_CLS && NET_CLS_ACT && IFB
+	help
+	  Translate supported native TC objects into an independently accounted
+	  NSS device stage. Native queue algorithms, feature permission and IFB
+	  continuation remain with their Linux owners. Unsupported policy stays
+	  in software unless the user explicitly requires hardware execution.
+

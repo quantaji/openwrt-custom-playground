@@ -1,0 +1,1177 @@
+From: Codex
+Subject: [PATCH] net: ifb: add owned device-operation continuation
+
+Preserve native IFB continuation with explicit accepted and returned
+ownership. Keep actual queue waits, native feature choice and provider
+retirement distinct. Retain standard block/binder callbacks for late
+providers without claiming hardware execution while absent.
+
+Signed-off-by: Codex
+---
+diff --git a/drivers/net/ifb.c b/drivers/net/ifb.c
+index 0534d24..ab38d66 100644
+--- a/drivers/net/ifb.c
++++ b/drivers/net/ifb.c
+@@ -33,6 +33,9 @@
+ #include <linux/interrupt.h>
+ #include <linux/moduleparam.h>
+ #include <linux/netfilter_netdev.h>
++#include <linux/refcount.h>
++#include <net/ifb.h>
++#include <net/pkt_cls.h>
+ #include <net/pkt_sched.h>
+ #include <net/net_namespace.h>
+ 
+@@ -44,6 +47,52 @@ struct ifb_q_stats {
+ 	struct u64_stats_sync	sync;
+ };
+ 
++struct ifb_binding {
++	refcount_t refs;
++	struct net_device *dev;
++	const struct ifb_provider_ops *ops;
++	void *private;
++	spinlock_t lock;
++	unsigned int accepted;
++	unsigned int ready;
++	bool published;
++	bool closing;
++	bool detached;
++};
++
++/* This is the actual native callback binding, not an offload policy copy.
++ * Provider presence may change while block/binder and its native counts live.
++ * The context is released only after the native UNBIND playback has finished.
++ */
++struct ifb_block {
++	struct list_head node;
++	struct net_device *dev;
++	struct tcf_block *block;
++	struct flow_block *flow_block;
++	enum flow_block_binder_type binder;
++	struct flow_block_cb *callback;
++	struct ifb_binding *provider;
++};
++
++enum ifb_wait_kind { IFB_WAIT_NONE, IFB_WAIT_RESOURCE, IFB_WAIT_DISPOSITION };
++struct ifb_tx_wait {
++	enum ifb_wait_kind kind;
++	struct ifb_binding *binding;
++	void *operation;
++	size_t charge;
++};
++
++enum ifb_packet_state { IFB_PACKET_LOAN = 1, IFB_PACKET_READY };
++struct ifb_packet {
++	struct ifb_binding *binding;
++	struct net_device *source;
++	u32 state;
++	u16 queue;
++	u16 mac_len;
++	bool from_ingress;
++};
++
++
+ struct ifb_q_private {
+ 	struct net_device	*dev;
+ 	struct tasklet_struct   ifb_tasklet;
+@@ -51,12 +100,18 @@ struct ifb_q_private {
+ 	int			txqnum;
+ 	struct sk_buff_head     rq;
+ 	struct sk_buff_head     tq;
++	struct sk_buff_head	completed;
++	spinlock_t		tx_state;
++	struct ifb_tx_wait	wait;
+ 	struct ifb_q_stats	rx_stats;
+ 	struct ifb_q_stats	tx_stats;
+ } ____cacheline_aligned_in_smp;
+ 
+ struct ifb_dev_private {
+ 	struct ifb_q_private *tx_private;
++	struct ifb_binding __rcu *binding;
++	struct list_head blocks;
++	struct list_head block_callbacks;
+ };
+ 
+ /* For ethtools stats. */
+@@ -74,6 +129,8 @@ static const struct ifb_q_stats_desc ifb_q_stats_desc[] = {
+ 
+ #define IFB_Q_STATS_LEN	ARRAY_SIZE(ifb_q_stats_desc)
+ 
++static const struct net_device_ops ifb_netdev_ops;
++
+ static netdev_tx_t ifb_xmit(struct sk_buff *skb, struct net_device *dev);
+ static int ifb_open(struct net_device *dev);
+ static int ifb_close(struct net_device *dev);
+@@ -86,69 +143,726 @@ static void ifb_update_q_stats(struct ifb_q_stats *stats, int len)
+ 	u64_stats_update_end(&stats->sync);
+ }
+ 
++static bool ifb_binding_get(struct ifb_binding *binding)
++{
++	if (!try_module_get(binding->ops->owner))
++		return false;
++	if (!binding->ops->get(binding->private)) {
++		module_put(binding->ops->owner);
++		return false;
++	}
++	refcount_inc(&binding->refs);
++	return true;
++}
++
++static void ifb_binding_put(struct ifb_binding *binding)
++{
++	const struct ifb_provider_ops *ops = binding->ops;
++	struct net_device *dev = binding->dev;
++	void *private = binding->private;
++	bool closing = READ_ONCE(binding->closing);
++	bool release;
++
++	release = refcount_dec_and_test(&binding->refs);
++	/* No binding dereference after publishing this reference release. A
++	 * concurrently progressing unbind may now release the idle registration.
++	 * The saved provider storage and module remain held through notification.
++	 */
++	if (closing)
++		ops->drained(private);
++	if (release) {
++		dev_put(dev);
++		kfree(binding);
++	}
++	ops->put(private);
++	module_put(ops->owner);
++}
++
++static enum ifb_disposition ifb_query(struct ifb_binding *binding, u16 queue,
++				    void **operation)
++{
++	enum ifb_disposition disposition;
++
++	*operation = NULL;
++	disposition = binding->ops->query(binding->private, queue, operation);
++	if (disposition == IFB_DEVICE &&
++	    (!READ_ONCE(binding->published) ||
++	     !tc_can_offload(binding->dev))) {
++		binding->ops->operation_put(*operation);
++		*operation = NULL;
++		return IFB_HOLD;
++	}
++	return disposition;
++}
++
++static void ifb_wait_clear(struct ifb_q_private *txp, struct ifb_tx_wait *old)
++{
++	lockdep_assert_held(&txp->tx_state);
++	*old = txp->wait;
++	if (old->kind == IFB_WAIT_RESOURCE)
++		old->binding->ops->disarm(old->operation, txp->txqnum);
++	memset(&txp->wait, 0, sizeof(txp->wait));
++}
++
++static void ifb_wait_put(struct ifb_tx_wait *old)
++{
++	if (!old->binding)
++		return;
++	if (old->operation)
++		old->binding->ops->operation_put(old->operation);
++	ifb_binding_put(old->binding);
++}
++
++static void ifb_tx_retry(struct ifb_q_private *txp,
++			 struct ifb_binding *expected, bool resource_progress)
++{
++	struct netdev_queue *txq = netdev_get_tx_queue(txp->dev, txp->txqnum);
++	struct ifb_tx_wait released[2] = {};
++	struct ifb_binding *binding = NULL;
++	enum ifb_disposition disposition;
++	struct ifb_ready ready;
++	void *queried_operation = NULL;
++	size_t charge;
++	unsigned int nr = 0, i;
++
++	spin_lock_bh(&txp->tx_state);
++	if (txp->wait.binding != expected || !netif_running(txp->dev))
++		goto unlock;
++	charge = txp->wait.charge;
++	binding = txp->wait.binding;
++	if (!ifb_binding_get(binding)) {
++		binding = NULL;
++		goto unlock;
++	}
++	if (resource_progress) {
++		if (txp->wait.kind != IFB_WAIT_RESOURCE)
++			goto unlock;
++		ready = binding->ops->ready(txp->wait.operation, txp->wait.charge);
++		if (ready.status == IFB_RESOURCE_WAIT)
++			goto unlock;
++		/* A closed old operation cannot become ready through a newer
++		 * operation. Only the actual disposition below grants handback or
++		 * establishes a distinct resource wait for a replacement.
++		 */
++	}
++
++	disposition = ifb_query(binding, txp->txqnum, &queried_operation);
++	if (disposition == IFB_NATIVE || disposition == IFB_DISPOSE) {
++		ifb_wait_clear(txp, &released[nr++]);
++		if (skb_queue_empty(&txp->rq))
++			netif_tx_wake_queue(txq);
++		goto unlock;
++	}
++	if (disposition == IFB_HOLD) {
++		if (txp->wait.kind == IFB_WAIT_RESOURCE) {
++			binding->ops->disarm(txp->wait.operation, txp->txqnum);
++			queried_operation = txp->wait.operation;
++			txp->wait.operation = NULL;
++			txp->wait.kind = IFB_WAIT_DISPOSITION;
++		}
++		goto unlock;
++	}
++
++	if (txp->wait.operation != queried_operation) {
++		ifb_wait_clear(txp, &released[nr++]);
++		if (!ifb_binding_get(binding))
++			goto unlock;
++		txp->wait = (struct ifb_tx_wait) {
++			.kind = IFB_WAIT_RESOURCE,
++			.binding = binding,
++			.operation = queried_operation,
++			.charge = charge,
++		};
++		queried_operation = NULL;
++	} else {
++		txp->wait.kind = IFB_WAIT_RESOURCE;
++	}
++	ready = binding->ops->ready(txp->wait.operation, txp->wait.charge);
++	if (ready.status == IFB_RESOURCE_WAIT) {
++		binding->ops->arm(txp->wait.operation, binding, txp->txqnum,
++				  ready.resources);
++		ready = binding->ops->ready(txp->wait.operation, txp->wait.charge);
++	}
++	if (ready.status == IFB_ACCEPTED) {
++		ifb_wait_clear(txp, &released[nr++]);
++		netif_tx_wake_queue(txq);
++	} else if (ready.status == IFB_CLOSED || ready.status == IFB_REFUSED) {
++		/* Keep the same binding's disposition lifetime while releasing the
++		 * closed operation. There is no readiness query for a NULL use.
++		 */
++		ifb_wait_clear(txp, &released[nr++]);
++		if (ifb_binding_get(binding)) {
++			txp->wait.kind = IFB_WAIT_DISPOSITION;
++			txp->wait.binding = binding;
++		}
++	}
++unlock:
++	spin_unlock_bh(&txp->tx_state);
++	if (queried_operation)
++		binding->ops->operation_put(queried_operation);
++	for (i = 0; i < nr; i++)
++		ifb_wait_put(&released[i]);
++	if (binding)
++		ifb_binding_put(binding);
++}
++
++void ifb_tx_resource_progress(struct ifb_binding *binding, u16 queue)
++{
++	struct ifb_dev_private *dp = netdev_priv(binding->dev);
++
++	if (queue < binding->dev->num_tx_queues)
++		ifb_tx_retry(&dp->tx_private[queue], binding, true);
++}
++EXPORT_SYMBOL_GPL(ifb_tx_resource_progress);
++
++void ifb_tx_disposition_progress(struct ifb_binding *binding)
++{
++	struct ifb_dev_private *dp = netdev_priv(binding->dev);
++	unsigned int i;
++
++	for (i = 0; i < binding->dev->num_tx_queues; i++)
++		ifb_tx_retry(&dp->tx_private[i], binding, false);
++}
++EXPORT_SYMBOL_GPL(ifb_tx_disposition_progress);
++
++static void ifb_tx_stop(struct ifb_q_private *txp, struct ifb_binding *binding,
++			void *operation, size_t charge, unsigned int resources)
++{
++	struct ifb_tx_wait old = {};
++	bool retained = false;
++
++	spin_lock_bh(&txp->tx_state);
++	if (txp->wait.operation != operation || txp->wait.binding != binding) {
++		ifb_wait_clear(txp, &old);
++		if (ifb_binding_get(binding)) {
++			if (!operation || binding->ops->operation_get(operation)) {
++				txp->wait.binding = binding;
++				txp->wait.operation = operation;
++				retained = true;
++			} else {
++				/* Keep a real disposition wait even if this operation
++				 * has already closed. The binding remains referenced.
++				 */
++				txp->wait.binding = binding;
++				operation = NULL;
++				retained = true;
++			}
++		}
++	} else {
++		retained = true;
++	}
++	if (retained) {
++		txp->wait.kind = operation ? IFB_WAIT_RESOURCE : IFB_WAIT_DISPOSITION;
++		txp->wait.charge = charge;
++		if (operation)
++			binding->ops->arm(operation, binding, txp->txqnum, resources);
++	}
++	netif_tx_stop_queue(netdev_get_tx_queue(txp->dev, txp->txqnum));
++	spin_unlock_bh(&txp->tx_state);
++	ifb_wait_put(&old);
++	/* Always schedule an actual stop/recheck. BUSY retains no packet, and
++	 * wake schedules its native qdisc rather than silently starting it.
++	 */
++	ifb_tx_retry(txp, binding, false);
++}
++
++static void ifb_packet_put(struct ifb_packet *packet)
++{
++	dev_put(packet->source);
++	ifb_binding_put(packet->binding);
++}
++
++void ifb_loan_dispose(struct sk_buff *original)
++{
++	struct ifb_packet *stored = (void *)original->cb;
++	struct ifb_packet packet;
++
++	if (cmpxchg(&stored->state, IFB_PACKET_LOAN, 0) != IFB_PACKET_LOAN)
++		return;
++	packet = *stored;
++	spin_lock_bh(&packet.binding->lock);
++	packet.binding->accepted--;
++	spin_unlock_bh(&packet.binding->lock);
++	ifb_packet_put(&packet);
++}
++EXPORT_SYMBOL_GPL(ifb_loan_dispose);
++
++void ifb_loan_complete(struct sk_buff *original, struct sk_buff *returned)
++{
++	struct ifb_packet *stored = (void *)original->cb;
++	struct ifb_q_private *txp;
++	struct ifb_dev_private *dp;
++	struct ifb_packet packet;
++	struct ifb_binding *binding;
++	bool deliver;
++
++	if (!returned) {
++		ifb_loan_dispose(original);
++		return;
++	}
++	if (cmpxchg(&stored->state, IFB_PACKET_LOAN, 0) != IFB_PACKET_LOAN) {
++		dev_kfree_skb_any(returned);
++		return;
++	}
++	packet = *stored;
++	binding = packet.binding;
++	dp = netdev_priv(binding->dev);
++	txp = &dp->tx_private[packet.queue];
++	spin_lock_bh(&binding->lock);
++	deliver = !binding->closing && netif_running(binding->dev) &&
++		  READ_ONCE(packet.source->reg_state) == NETREG_REGISTERED;
++	binding->accepted--;
++	if (deliver)
++		binding->ready++;
++	spin_unlock_bh(&binding->lock);
++	if (!deliver) {
++		ifb_packet_put(&packet);
++		dev_kfree_skb_any(returned);
++		return;
++	}
++	packet.state = IFB_PACKET_READY;
++	memcpy(returned->cb, &packet, sizeof(packet));
++	skb_queue_tail(&txp->completed, returned);
++	tasklet_schedule(&txp->ifb_tasklet);
++}
++EXPORT_SYMBOL_GPL(ifb_loan_complete);
++
++void ifb_fresh_ingress_continue(struct net_device *source, struct sk_buff *skb,
++				 u16 mac_len)
++{
++	if (READ_ONCE(source->reg_state) != NETREG_REGISTERED ||
++	    !pskb_may_pull(skb, mac_len)) {
++		dev_kfree_skb_any(skb);
++		dev_put(source);
++		return;
++	}
++	skb->dev = source;
++	skb->redirected = 0;
++#ifdef CONFIG_NET_CLS_ACT
++	skb->tc_skip_classify = 1;
++#endif
++	nf_skip_egress(skb, true);
++	skb_pull_rcsum(skb, mac_len);
++	netif_receive_skb(skb);
++	dev_put(source);
++}
++EXPORT_SYMBOL_GPL(ifb_fresh_ingress_continue);
++
++static struct ifb_binding *ifb_binding_read(struct net_device *dev)
++{
++	struct ifb_dev_private *dp = netdev_priv(dev);
++	struct ifb_binding *binding;
++
++	rcu_read_lock();
++	binding = rcu_dereference(dp->binding);
++	if (binding && !ifb_binding_get(binding))
++		binding = ERR_PTR(-ESHUTDOWN);
++	rcu_read_unlock();
++	return binding;
++}
++
++static int ifb_block_callback(enum tc_setup_type type, void *data, void *private)
++{
++	struct ifb_block *block = private;
++	struct ifb_binding *binding = block->provider;
++
++	/* The native binding requests locked driver callbacks. Provider detach
++	 * uses this same RTNL serialization, including during module exit.
++	 */
++	ASSERT_RTNL();
++	if (!binding)
++		return -EOPNOTSUPP;
++	return binding->ops->setup_block(binding->private, block->block,
++					 block->binder, type, data);
++}
++
++static int ifb_block_provider(struct ifb_block *block,
++			      struct ifb_binding *binding, bool add)
++{
++	struct flow_block_offload offload = {
++		.command = add ? FLOW_BLOCK_BIND : FLOW_BLOCK_UNBIND,
++		.binder_type = block->binder,
++		.net = dev_net(block->dev),
++		.block = block->flow_block,
++		.native_block = block->block,
++	};
++	int err;
++
++	ASSERT_RTNL();
++	err = binding->ops->setup_block(binding->private, block->block,
++					block->binder, TC_SETUP_BLOCK, &offload);
++	if (add && err)
++		return err;
++	/* Native UNBIND ends the borrow even when feature retirement reports a
++	 * hardware error. Independent owner records retain its exposed resources.
++	 */
++	block->provider = add ? binding : NULL;
++	return err;
++}
++
++static void ifb_block_release(void *private)
++{
++	struct ifb_block *block = private;
++
++	ASSERT_RTNL();
++	if (block->provider)
++		ifb_block_provider(block, block->provider, false);
++	list_del(&block->node);
++	kfree(block);
++}
++
++static int ifb_setup_block(struct net_device *dev, struct flow_block_offload *f)
++{
++	struct ifb_dev_private *dp = netdev_priv(dev);
++	struct ifb_binding *binding = rtnl_dereference(dp->binding);
++	struct ifb_block *block;
++	int err;
++
++	ASSERT_RTNL();
++	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS &&
++	    f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_EGRESS &&
++	    f->binder_type != FLOW_BLOCK_BINDER_TYPE_UNSPEC)
++		return -EOPNOTSUPP;
++	f->driver_block_list = &dp->block_callbacks;
++	f->unlocked_driver_cb = false;
++	list_for_each_entry(block, &dp->blocks, node) {
++		if (block->block != f->native_block || block->binder != f->binder_type)
++			continue;
++		if (f->command != FLOW_BLOCK_UNBIND)
++			return -EBUSY;
++		flow_block_cb_remove(block->callback, f);
++		list_del(&block->callback->driver_list);
++		/* Original native playback removes each counted member before its
++		 * callback release ends the provider's borrowed block identity.
++		 */
++		return 0;
++	}
++	if (f->command != FLOW_BLOCK_BIND)
++		return -ENOENT;
++	block = kzalloc(sizeof(*block), GFP_KERNEL);
++	if (!block)
++		return -ENOMEM;
++	block->dev = dev;
++	block->block = f->native_block;
++	block->flow_block = f->block;
++	block->binder = f->binder_type;
++	block->callback = flow_block_cb_alloc(ifb_block_callback, block, block,
++					      ifb_block_release);
++	if (IS_ERR(block->callback)) {
++		err = PTR_ERR(block->callback);
++		kfree(block);
++		return err;
++	}
++	list_add_tail(&block->node, &dp->blocks);
++	if (binding) {
++		err = ifb_block_provider(block, binding, true);
++		if (err) {
++			flow_block_cb_free(block->callback);
++			return err;
++		}
++	}
++	flow_block_cb_add(block->callback, f);
++	list_add_tail(&block->callback->driver_list, &dp->block_callbacks);
++	return 0;
++}
++
++int ifb_provider_replay(struct ifb_binding *binding, struct tcf_block *native,
++		       enum flow_block_binder_type binder, bool add,
++		       struct netlink_ext_ack *extack)
++{
++#ifdef CONFIG_NET_CLS
++	struct ifb_dev_private *dp = netdev_priv(binding->dev);
++	struct ifb_block *block;
++
++	ASSERT_RTNL();
++	list_for_each_entry(block, &dp->blocks, node) {
++		if (block->block == native && block->binder == binder &&
++		    block->provider == binding)
++			return tcf_block_replay_bound(native, ifb_block_callback,
++						      block, add, extack);
++	}
++#endif
++	return -ENOENT;
++}
++EXPORT_SYMBOL_GPL(ifb_provider_replay);
++
++struct ifb_binding *ifb_provider_bind(struct net_device *dev,
++		const struct ifb_provider_ops *ops, void *private)
++{
++	struct ifb_dev_private *dp = netdev_priv(dev);
++	struct ifb_binding *binding;
++	struct ifb_block *block;
++	int err;
++
++	ASSERT_RTNL();
++	if (dev->netdev_ops != &ifb_netdev_ops ||
++	    READ_ONCE(dev->reg_state) != NETREG_REGISTERED)
++		return ERR_PTR(-EINVAL);
++	if (rtnl_dereference(dp->binding))
++		return ERR_PTR(-EBUSY);
++	binding = kzalloc(sizeof(*binding), GFP_KERNEL);
++	if (!binding)
++		return ERR_PTR(-ENOMEM);
++	if (!ops->get(private)) {
++		kfree(binding);
++		return ERR_PTR(-ENODEV);
++	}
++	refcount_set(&binding->refs, 1);
++	spin_lock_init(&binding->lock);
++	dev_hold(dev);
++	binding->dev = dev;
++	binding->ops = ops;
++	binding->private = private;
++	list_for_each_entry(block, &dp->blocks, node) {
++		err = ifb_block_provider(block, binding, true);
++		if (err)
++			goto unbind_blocks;
++	}
++	/* Control borrows are complete before data readers can acquire a
++	 * reference. Failed preparation has never published this binding.
++	 */
++	binding->published = true;
++	rcu_assign_pointer(dp->binding, binding);
++	netdev_update_features(dev);
++	return binding;
++
++unbind_blocks:
++	list_for_each_entry(block, &dp->blocks, node)
++		if (block->provider == binding)
++			ifb_block_provider(block, binding, false);
++	ops->put(private);
++	dev_put(dev);
++	kfree(binding);
++	return ERR_PTR(err);
++}
++EXPORT_SYMBOL_GPL(ifb_provider_bind);
++
++int ifb_provider_unbind(struct ifb_binding *binding)
++{
++	struct ifb_dev_private *dp = netdev_priv(binding->dev);
++	struct ifb_block *block;
++	void *operation;
++	unsigned int i;
++	enum ifb_disposition disposition;
++	int err;
++
++	ASSERT_RTNL();
++	if (!binding->detached) {
++		if (rtnl_dereference(dp->binding) != binding)
++			return -ENOENT;
++		spin_lock_bh(&binding->lock);
++		binding->closing = true;
++		binding->published = false;
++		spin_unlock_bh(&binding->lock);
++		netdev_update_features(binding->dev);
++		list_for_each_entry(block, &dp->blocks, node) {
++			if (block->provider != binding)
++				continue;
++			err = ifb_provider_replay(binding, block->block, block->binder,
++						  false, NULL);
++			if (err)
++				return err;
++			ifb_block_provider(block, binding, false);
++		}
++		err = binding->ops->stop(binding->private);
++		if (err)
++			return err;
++		synchronize_net();
++		ifb_tx_disposition_progress(binding);
++		for (i = 0; i < binding->dev->num_tx_queues; i++) {
++			disposition = ifb_query(binding, i, &operation);
++			if (operation)
++				binding->ops->operation_put(operation);
++			if (READ_ONCE(binding->dev->reg_state) == NETREG_REGISTERED &&
++			    disposition != IFB_NATIVE && disposition != IFB_DISPOSE)
++				return -EINPROGRESS;
++		}
++		/* Handback is actually authorized before provider absence can be
++		 * read as native permission. Shut readers before checking references.
++		 */
++		rcu_assign_pointer(dp->binding, NULL);
++		binding->detached = true;
++		synchronize_net();
++		/* A reader which could not pin retiring provider code stopped on
++		 * this actual published gate. Only proven handback clears it.
++		 */
++		if (netif_running(binding->dev)) {
++			for (i = 0; i < binding->dev->num_tx_queues; i++)
++				if (skb_queue_empty(&dp->tx_private[i].rq))
++					netif_tx_wake_queue(netdev_get_tx_queue(binding->dev, i));
++		}
++	}
++	/* No RTNL-dependent worker is waited for. Actual holders retain this
++	 * device and callback code until a later invocation finishes unbind.
++	 */
++	if (refcount_read(&binding->refs) != 1)
++		return -EINPROGRESS;
++	/* Idle registration acquired storage, not a permanent module pin. */
++	binding->ops->put(binding->private);
++	dev_put(binding->dev);
++	kfree(binding);
++	return 0;
++}
++
++EXPORT_SYMBOL_GPL(ifb_provider_unbind);
++
++static netdev_features_t ifb_fix_features(struct net_device *dev,
++					 netdev_features_t features)
++{
++	struct ifb_dev_private *dp = netdev_priv(dev);
++	struct ifb_binding *binding = rtnl_dereference(dp->binding);
++
++	if (!binding || !READ_ONCE(binding->published))
++		features &= ~NETIF_F_HW_TC;
++	return features;
++}
++
++static netdev_features_t ifb_features_check(struct sk_buff *skb,
++		struct net_device *dev, netdev_features_t features)
++{
++	struct ifb_dev_private *dp = netdev_priv(dev);
++
++	if (rcu_access_pointer(dp->binding))
++		features &= ~(NETIF_F_GSO_MASK | NETIF_F_SG | NETIF_F_FRAGLIST |
++			      NETIF_F_CSUM_MASK | NETIF_F_HW_VLAN_CTAG_TX |
++			      NETIF_F_HW_VLAN_STAG_TX);
++	return features;
++}
++
++static int ifb_setup_tc(struct net_device *dev, enum tc_setup_type type, void *data)
++{
++	struct ifb_dev_private *dp = netdev_priv(dev);
++	struct ifb_binding *binding;
++
++	ASSERT_RTNL();
++	if (type == TC_SETUP_BLOCK)
++		return ifb_setup_block(dev, data);
++	binding = rtnl_dereference(dp->binding);
++	if (!binding)
++		return -EOPNOTSUPP;
++	/* The provider routes cleanup/query before its new-execution feature
++	 * gate. Native software results are never converted into HW success.
++	 */
++	return binding->ops->setup_tc(binding->private, type, data);
++}
++
+ static void ifb_ri_tasklet(struct tasklet_struct *t)
+ {
+ 	struct ifb_q_private *txp = from_tasklet(txp, t, ifb_tasklet);
+-	struct netdev_queue *txq;
++	struct netdev_queue *txq = netdev_get_tx_queue(txp->dev, txp->txqnum);
++	struct ifb_binding *binding;
+ 	struct sk_buff *skb;
+ 
+-	txq = netdev_get_tx_queue(txp->dev, txp->txqnum);
+-	skb = skb_peek(&txp->tq);
+-	if (!skb) {
++	if (skb_queue_empty(&txp->tq)) {
+ 		if (!__netif_tx_trylock(txq))
+ 			goto resched;
+ 		skb_queue_splice_tail_init(&txp->rq, &txp->tq);
+ 		__netif_tx_unlock(txq);
+ 	}
+ 
+-	while ((skb = __skb_dequeue(&txp->tq)) != NULL) {
+-		/* Skip tc and netfilter to prevent redirection loop. */
++	for (;;) {
++		struct ifb_packet packet = {};
++		struct net_device *source;
++		bool completed = false;
++		bool from_ingress;
++		u16 mac_len;
++
++		skb = __skb_dequeue(&txp->tq);
++		if (!skb) {
++			skb = skb_dequeue(&txp->completed);
++			if (!skb)
++				break;
++			packet = *(struct ifb_packet *)skb->cb;
++			completed = true;
++		}
++		/* Preserve the original native continuation-stage observation. */
+ 		skb->redirected = 0;
+ #ifdef CONFIG_NET_CLS_ACT
+ 		skb->tc_skip_classify = 1;
+ #endif
+ 		nf_skip_egress(skb, true);
+-
+ 		ifb_update_q_stats(&txp->tx_stats, skb->len);
+-
+-		rcu_read_lock();
+-		skb->dev = dev_get_by_index_rcu(dev_net(txp->dev), skb->skb_iif);
+-		if (!skb->dev) {
++		if (completed) {
++			source = packet.source;
++			from_ingress = packet.from_ingress;
++			mac_len = packet.mac_len;
++			if (READ_ONCE(source->reg_state) != NETREG_REGISTERED ||
++			    READ_ONCE(packet.binding->closing))
++				goto drop;
++		} else {
++			from_ingress = skb->from_ingress;
++			mac_len = skb->mac_len;
++			rcu_read_lock();
++			source = dev_get_by_index_rcu(dev_net(txp->dev), skb->skb_iif);
+ 			rcu_read_unlock();
+-			dev_kfree_skb(skb);
+-			txp->dev->stats.tx_dropped++;
+-			if (skb_queue_len(&txp->tq) != 0)
+-				goto resched;
+-			break;
++			if (!source) {
++				dev_kfree_skb(skb);
++				txp->dev->stats.tx_dropped++;
++				if (!skb_queue_empty(&txp->tq))
++					goto resched;
++				break;
++			}
+ 		}
+-		rcu_read_unlock();
+-		skb->skb_iif = txp->dev->ifindex;
+ 
+-		if (!skb->from_ingress) {
++		/* This is the same native IFB continuation for both populations;
++		 * a completed loan is never fed back through IFB TX/classification.
++		 */
++		skb->dev = source;
++		skb->skb_iif = txp->dev->ifindex;
++		if (!from_ingress) {
+ 			dev_queue_xmit(skb);
+-		} else {
+-			skb_pull_rcsum(skb, skb->mac_len);
++		} else if (!completed || pskb_may_pull(skb, mac_len)) {
++			skb_pull_rcsum(skb, mac_len);
+ 			netif_receive_skb(skb);
++		} else {
++			dev_kfree_skb(skb);
++			txp->dev->stats.tx_dropped++;
++		}
++		goto done;
++
++drop:
++		dev_kfree_skb(skb);
++		txp->dev->stats.tx_dropped++;
++done:
++		if (completed) {
++			spin_lock_bh(&packet.binding->lock);
++			packet.binding->ready--;
++			spin_unlock_bh(&packet.binding->lock);
++			ifb_packet_put(&packet);
+ 		}
+ 	}
+ 
+-	if (__netif_tx_trylock(txq)) {
+-		skb = skb_peek(&txp->rq);
+-		if (!skb) {
+-			txp->tasklet_pending = 0;
+-			if (netif_tx_queue_stopped(txq))
+-				netif_tx_wake_queue(txq);
++	if (!__netif_tx_trylock(txq))
++		goto resched;
++	if (!skb_queue_empty(&txp->rq)) {
++		__netif_tx_unlock(txq);
++		goto resched;
++	}
++	txp->tasklet_pending = 0;
++	if (netif_tx_queue_stopped(txq)) {
++		binding = ifb_binding_read(txp->dev);
++		if (IS_ERR(binding)) {
++			/* The retiring registration still owns the stopped gate. */
++		} else if (binding) {
++			bool waiting;
++
++			spin_lock_bh(&txp->tx_state);
++			waiting = txp->wait.kind != IFB_WAIT_NONE;
++			spin_unlock_bh(&txp->tx_state);
++			if (waiting)
++				ifb_tx_retry(txp, binding, false);
++			else
++				ifb_tx_stop(txp, binding, NULL, 0, 0);
++			ifb_binding_put(binding);
+ 		} else {
+-			__netif_tx_unlock(txq);
+-			goto resched;
++			netif_tx_wake_queue(txq);
+ 		}
+-		__netif_tx_unlock(txq);
+-	} else {
+-resched:
+-		txp->tasklet_pending = 1;
+-		tasklet_schedule(&txp->ifb_tasklet);
+ 	}
+-
++	__netif_tx_unlock(txq);
++	return;
++resched:
++	txp->tasklet_pending = 1;
++	tasklet_schedule(&txp->ifb_tasklet);
+ }
+ 
+ static void ifb_stats64(struct net_device *dev,
+@@ -187,6 +901,9 @@ static int ifb_dev_init(struct net_device *dev)
+ 	struct ifb_q_private *txp;
+ 	int i;
+ 
++	BUILD_BUG_ON(sizeof(struct ifb_packet) > sizeof_field(struct sk_buff, cb));
++	INIT_LIST_HEAD(&dp->blocks);
++	INIT_LIST_HEAD(&dp->block_callbacks);
+ 	txp = kcalloc(dev->num_tx_queues, sizeof(*txp), GFP_KERNEL);
+ 	if (!txp)
+ 		return -ENOMEM;
+@@ -196,6 +913,8 @@ static int ifb_dev_init(struct net_device *dev)
+ 		txp->dev = dev;
+ 		__skb_queue_head_init(&txp->rq);
+ 		__skb_queue_head_init(&txp->tq);
++		skb_queue_head_init(&txp->completed);
++		spin_lock_init(&txp->tx_state);
+ 		u64_stats_init(&txp->rx_stats.sync);
+ 		u64_stats_init(&txp->tx_stats.sync);
+ 		tasklet_setup(&txp->ifb_tasklet, ifb_ri_tasklet);
+@@ -279,6 +998,9 @@ static const struct net_device_ops ifb_netdev_ops = {
+ 	.ndo_start_xmit	= ifb_xmit,
+ 	.ndo_validate_addr = eth_validate_addr,
+ 	.ndo_init	= ifb_dev_init,
++	.ndo_setup_tc	= ifb_setup_tc,
++	.ndo_fix_features = ifb_fix_features,
++	.ndo_features_check = ifb_features_check,
+ };
+ 
+ static const struct ethtool_ops ifb_ethtool_ops = {
+@@ -318,6 +1040,7 @@ static void ifb_setup(struct net_device *dev)
+ 
+ 	dev->features |= IFB_FEATURES;
+ 	dev->hw_features |= dev->features;
++	dev->hw_features |= NETIF_F_HW_TC;
+ 	dev->hw_enc_features |= dev->features;
+ 	dev->vlan_features |= IFB_FEATURES & ~(NETIF_F_HW_VLAN_CTAG_TX |
+ 					       NETIF_F_HW_VLAN_STAG_TX);
+@@ -339,36 +1062,184 @@ static netdev_tx_t ifb_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
+ 	struct ifb_dev_private *dp = netdev_priv(dev);
+ 	struct ifb_q_private *txp = dp->tx_private + skb_get_queue_mapping(skb);
+-
+-	ifb_update_q_stats(&txp->rx_stats, skb->len);
++	struct ifb_binding *binding;
++	struct ifb_packet packet;
++	struct net_device *source;
++	enum ifb_disposition disposition;
++	struct ifb_ready result;
++	void *operation = NULL;
++	unsigned char saved_cb[sizeof(skb->cb)];
++	unsigned int bytes = skb->len;
+ 
+ 	if (!skb->redirected || !skb->skb_iif) {
++		ifb_update_q_stats(&txp->rx_stats, bytes);
+ 		dev_kfree_skb(skb);
+ 		dev->stats.rx_dropped++;
+ 		return NETDEV_TX_OK;
+ 	}
++	binding = ifb_binding_read(dev);
++	if (IS_ERR(binding)) {
++		netif_tx_stop_queue(netdev_get_tx_queue(dev, txp->txqnum));
++		return NETDEV_TX_BUSY;
++	}
++	if (!binding)
++		goto native;
++	disposition = ifb_query(binding, txp->txqnum, &operation);
++	if (disposition == IFB_NATIVE) {
++		ifb_binding_put(binding);
++		goto native;
++	}
++	if (disposition == IFB_DISPOSE)
++		goto dispose;
++	if (disposition == IFB_HOLD) {
++		ifb_tx_stop(txp, binding, NULL, skb->truesize, 0);
++		ifb_binding_put(binding);
++		return NETDEV_TX_BUSY;
++	}
++
++	rcu_read_lock();
++	source = dev_get_by_index_rcu(dev_net(dev), skb->skb_iif);
++	if (source && READ_ONCE(source->reg_state) == NETREG_REGISTERED)
++		dev_hold(source);
++	else
++		source = NULL;
++	rcu_read_unlock();
++	if (!source)
++		goto dispose;
++	if (!ifb_binding_get(binding)) {
++		dev_put(source);
++		goto dispose;
++	}
++	spin_lock_bh(&binding->lock);
++	if (binding->closing) {
++		spin_unlock_bh(&binding->lock);
++		dev_put(source);
++		ifb_binding_put(binding);
++		ifb_tx_stop(txp, binding, NULL, skb->truesize, 0);
++		binding->ops->operation_put(operation);
++		ifb_binding_put(binding);
++		return NETDEV_TX_BUSY;
++	}
++	binding->accepted++;
++	spin_unlock_bh(&binding->lock);
++	packet = (struct ifb_packet) {
++		.binding = binding,
++		.source = source,
++		.state = IFB_PACKET_LOAN,
++		.queue = txp->txqnum,
++		.mac_len = skb->mac_len,
++		.from_ingress = skb->from_ingress,
++	};
++	memcpy(saved_cb, skb->cb, sizeof(saved_cb));
++	memcpy(skb->cb, &packet, sizeof(packet));
++	result = binding->ops->submit(operation, skb);
++	if (result.status == IFB_ACCEPTED) {
++		/* A NAPI completion may already have consumed skb and its cb. */
++		ifb_update_q_stats(&txp->rx_stats, bytes);
++		result = binding->ops->ready(operation, 0);
++		if (result.status != IFB_ACCEPTED)
++			ifb_tx_stop(txp, binding,
++				    result.status == IFB_RESOURCE_WAIT ? operation : NULL,
++				    0, result.resources);
++		binding->ops->operation_put(operation);
++		ifb_binding_put(binding);
++		return NETDEV_TX_OK;
++	}
++
++	/* Refusal consumes neither the skb nor its continuation. Only this
++	 * unpublished reservation is undone, and the native qdisc cb restored.
++	 */
++	ifb_loan_dispose(skb);
++	memcpy(skb->cb, saved_cb, sizeof(saved_cb));
++	if (result.status == IFB_RESOURCE_WAIT) {
++		ifb_tx_stop(txp, binding, operation, skb->truesize, result.resources);
++		binding->ops->operation_put(operation);
++		ifb_binding_put(binding);
++		return NETDEV_TX_BUSY;
++	}
++	if (result.status == IFB_REFUSED)
++		goto dispose;
++	binding->ops->operation_put(operation);
++	operation = NULL;
++	disposition = ifb_query(binding, txp->txqnum, &operation);
++	if (operation) {
++		binding->ops->operation_put(operation);
++		operation = NULL;
++	}
++	if (disposition == IFB_NATIVE) {
++		ifb_binding_put(binding);
++		goto native;
++	}
++	if (disposition == IFB_DISPOSE)
++		goto dispose;
++	ifb_tx_stop(txp, binding, NULL, skb->truesize, 0);
++	ifb_binding_put(binding);
++	return NETDEV_TX_BUSY;
++
++dispose:
++	if (operation)
++		binding->ops->operation_put(operation);
++	ifb_binding_put(binding);
++	ifb_update_q_stats(&txp->rx_stats, bytes);
++	dev_kfree_skb(skb);
++	dev->stats.rx_dropped++;
++	return NETDEV_TX_OK;
+ 
++native:
++	ifb_update_q_stats(&txp->rx_stats, bytes);
+ 	if (skb_queue_len(&txp->rq) >= dev->tx_queue_len)
+ 		netif_tx_stop_queue(netdev_get_tx_queue(dev, txp->txqnum));
+-
+ 	__skb_queue_tail(&txp->rq, skb);
+ 	if (!txp->tasklet_pending) {
+ 		txp->tasklet_pending = 1;
+ 		tasklet_schedule(&txp->ifb_tasklet);
+ 	}
+-
+ 	return NETDEV_TX_OK;
+ }
+ 
+ static int ifb_close(struct net_device *dev)
+ {
++	struct ifb_dev_private *dp = netdev_priv(dev);
++	struct ifb_binding *binding = ifb_binding_read(dev);
++	unsigned int i;
++	int err = 0;
++
+ 	netif_tx_stop_all_queues(dev);
+-	return 0;
++	if (IS_ERR(binding))
++		return 0; /* Its actual unregister path completes the retirement. */
++	if (binding) {
++		err = binding->ops->stop(binding->private);
++		for (i = 0; i < dev->num_tx_queues; i++) {
++			struct ifb_q_private *txp = &dp->tx_private[i];
++			struct ifb_tx_wait old;
++
++			spin_lock_bh(&txp->tx_state);
++			ifb_wait_clear(txp, &old);
++			spin_unlock_bh(&txp->tx_state);
++			ifb_wait_put(&old);
++		}
++		ifb_binding_put(binding);
++	}
++	return err;
+ }
+ 
+ static int ifb_open(struct net_device *dev)
+ {
+-	netif_tx_start_all_queues(dev);
++	struct ifb_dev_private *dp = netdev_priv(dev);
++	struct ifb_binding *binding = ifb_binding_read(dev);
++	unsigned int i;
++
++	if (IS_ERR(binding)) {
++		netif_tx_stop_all_queues(dev);
++		return 0;
++	}
++	if (!binding) {
++		netif_tx_start_all_queues(dev);
++		return 0;
++	}
++	for (i = 0; i < dev->num_tx_queues; i++)
++		ifb_tx_stop(&dp->tx_private[i], binding, NULL, 0, 0);
++	ifb_binding_put(binding);
+ 	return 0;
+ }
+ 
+diff --git a/include/net/ifb.h b/include/net/ifb.h
+new file mode 100644
+index 0000000..394463c
+--- /dev/null
++++ b/include/net/ifb.h
+@@ -0,0 +1,76 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _NET_IFB_H
++#define _NET_IFB_H
++
++#include <linux/netdevice.h>
++#include <net/flow_offload.h>
++
++struct ifb_binding;
++
++enum ifb_disposition { IFB_NATIVE, IFB_HOLD, IFB_DEVICE, IFB_DISPOSE };
++enum ifb_submit_status { IFB_ACCEPTED, IFB_RESOURCE_WAIT, IFB_CLOSED, IFB_REFUSED };
++struct ifb_ready {
++	enum ifb_submit_status status;
++	unsigned int resources;
++};
++
++/* query/ready/submit/progress and storage references are non-sleeping.
++ * query returns one retained actual operation only for IFB_DEVICE; ready and
++ * submit use that same operation, never a lookup of its replacement. arm must
++ * publish the actual recipient before requesting hardware resource progress.
++ * Callbacks into IFB progress run after the provider's resource locks release.
++ */
++struct ifb_provider_ops {
++	struct module *owner;
++	bool (*get)(void *private);
++	void (*put)(void *private);
++	enum ifb_disposition (*query)(void *private, u16 queue, void **operation);
++	bool (*operation_get)(void *operation);
++	void (*operation_put)(void *operation);
++	struct ifb_ready (*ready)(void *operation, size_t charge);
++	struct ifb_ready (*submit)(void *operation, struct sk_buff *skb);
++	void (*arm)(void *operation, struct ifb_binding *binding, u16 queue,
++		    unsigned int resources);
++	void (*disarm)(void *operation, u16 queue);
++	int (*setup_tc)(void *private, enum tc_setup_type type, void *data);
++	/* RTNL, real block/binder lifetime. BIND establishes the borrow without
++	 * replaying members; UNBIND ends it after native remove/count playback.
++	 * These callbacks never recursively unbind this provider registration.
++	 */
++	int (*setup_block)(void *private, struct tcf_block *block,
++			   enum flow_block_binder_type binder,
++			   enum tc_setup_type type, void *data);
++	int (*stop)(void *private);
++	/* Non-sleeping, locks released, provider storage/code still referenced.
++	 * Actual binding reference release is visible before this closing-only
++	 * progress notification; the callback must not inspect the old binding.
++	 */
++	void (*drained)(void *private);
++};
++
++/* RTNL. Idle registration owns storage, not a permanent module reference.
++ * Unbind closes admission first. -EINPROGRESS retains this exact binding until
++ * its accepted/ready/wait lifetime ends; call again after actual drain.
++ */
++struct ifb_binding *ifb_provider_bind(struct net_device *dev,
++		const struct ifb_provider_ops *ops, void *private);
++int ifb_provider_unbind(struct ifb_binding *binding);
++int ifb_provider_replay(struct ifb_binding *binding, struct tcf_block *block,
++		       enum flow_block_binder_type binder, bool add,
++		       struct netlink_ext_ack *extack);
++void ifb_tx_resource_progress(struct ifb_binding *binding, u16 queue);
++void ifb_tx_disposition_progress(struct ifb_binding *binding);
++
++/* Original cb is retained by the provider until one call. Every non-NULL
++ * returned skb is consumed. The caller still owns original storage unless it
++ * is the returned skb, and never reads its consumed cb after this call.
++ */
++void ifb_loan_complete(struct sk_buff *original, struct sk_buff *returned);
++void ifb_loan_dispose(struct sk_buff *original);
++/* Consumes skb and one source reference; only a proven completed native
++ * ingress position may use this entry. Frame data still includes mac_len.
++ */
++void ifb_fresh_ingress_continue(struct net_device *source, struct sk_buff *skb,
++				 u16 mac_len);
++
++#endif

@@ -37,6 +37,7 @@ struct qdx_mailbox {
 };
 
 struct qdx_hw {
+	struct mutex operation_lock;
 	struct clk_bulk_data clocks[27];
 	struct regulator *supply;
 	struct reset_control *core_reset[QDX_CORES][5];
@@ -106,6 +107,7 @@ int qdx_hw_get(struct qdx *qdx)
 	if (!hw)
 		return -ENOMEM;
 	qdx->hw = hw;
+	mutex_init(&hw->operation_lock);
 	for (i = 0; i < ARRAY_SIZE(qdx_clocks); i++)
 		hw->clocks[i].id = qdx_clocks[i].name;
 	err = devm_clk_bulk_get(qdx->dev, ARRAY_SIZE(hw->clocks), hw->clocks);
@@ -192,6 +194,7 @@ int qdx_hw_stop(struct qdx *qdx)
 	struct qdx_hw *hw = qdx->hw;
 	int i, j, index, err, first = 0;
 
+	mutex_lock(&hw->operation_lock);
 	/* Provider success records the hold operation, not a measured DMA drain. */
 	if (hw->clocked) {
 		for (i = 0; i < QDX_CORES; i++) {
@@ -219,6 +222,7 @@ int qdx_hw_stop(struct qdx *qdx)
 				first = err;
 		}
 	}
+	mutex_unlock(&hw->operation_lock);
 	return first;
 }
 
@@ -301,20 +305,27 @@ unwind:
 int qdx_hw_start_core(struct qdx_core *core)
 {
 	struct qdx_hw *hw = core->qdx->hw;
-	int i, err;
+	int i, err = 0;
 
-	if (!hw->clocked || !core->map)
-		return -EINVAL;
+	mutex_lock(&hw->operation_lock);
+	if (atomic_read(&core->qdx->failure)) {
+		err = -ESHUTDOWN;
+		goto out;
+	}
+	if (!hw->clocked || !core->map) {
+		err = -EINVAL;
+		goto out;
+	}
 	/* A provider failure cannot prove that its hardware write had no effect. */
 	hw->executed = true;
 	err = reset_control_deassert(hw->core_reset[core->id][0]);
 	if (err)
-		return err;
+		goto out;
 	usleep_range(10, 20);
 	for (i = 1; i < 5; i++) {
 		err = reset_control_deassert(hw->core_reset[core->id][i]);
 		if (err)
-			return err;
+			goto out;
 	}
 	writel(1, core->csm + QDX_CSM_RESET);
 	writel(1, core->csm + QDX_CSM_AMC);
@@ -326,7 +337,9 @@ int qdx_hw_start_core(struct qdx_core *core)
 	readl(core->csm + QDX_CSM_FETCH);
 	writel(0, core->csm + QDX_CSM_RESET);
 	readl(core->csm + QDX_CSM_RESET);
-	return 0;
+out:
+	mutex_unlock(&hw->operation_lock);
+	return err;
 }
 
 int qdx_hw_notify(struct qdx_core *core, unsigned int channel)

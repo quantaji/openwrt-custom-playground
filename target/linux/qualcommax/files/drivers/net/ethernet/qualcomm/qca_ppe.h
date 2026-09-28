@@ -17,6 +17,7 @@
 #define QCA_PPE_MAX_PORTS	8
 #define QCA_PPE_CPU_PORT	0
 #define QCA_PPE_MAX_BRIDGES	8
+#define PPE_MAX_PORT_QUEUES	20 /* 16 native UC plus four native MC queues. */
 
 
 /* --- Global --- */
@@ -292,6 +293,7 @@
 #define   PPE_MRU_MTU_CTRL_MTU		GENMASK(29, 16)
 #define   PPE_MRU_MTU_CTRL_RX_CNT_EN	BIT(0)
 #define   PPE_MRU_MTU_CTRL_TX_CNT_EN	BIT(1)
+#define   PPE_MRU_MTU_CTRL_SRC_PROFILE	GENMASK(3, 2)
 
 /* --- L3 (base 0x200000) --- */
 #define PPE_L3_BASE			0x200000
@@ -322,6 +324,9 @@
 
 #define PPE_TM_RING_Q_MAP(r)		(PPE_TM_BASE + 0x2a000 + (r) * 0x40)
 
+#define PPE_TM_DEQUEUE_DISABLE(q)	(PPE_TM_BASE + 0x30000 + (q) * 0x10)
+#define   PPE_QUEUE_DISABLED		BIT(0)
+
 #define PPE_TM_L1_FLOW_MAP(i)		(PPE_TM_BASE + 0x40000 + (i) * 0x10)
 #define   PPE_L1_SP_ID			GENMASK(3, 0)
 #define   PPE_L1_C_PRI			GENMASK(6, 4)
@@ -335,6 +340,23 @@
 
 #define PPE_TM_L1_PORT_MAP(i)		(PPE_TM_BASE + 0x46000 + (i) * 0x10)
 #define   PPE_L1_PORT_NUM		GENMASK(3, 0)
+
+#define PPE_TM_PORT_SHAPER_SLOT		(PPE_TM_BASE + 0x18)
+#define   PPE_PORT_SHAPER_SLOT		GENMASK(11, 0)
+#define PPE_TM_PORT_SHAPER_SIGN(p)	(PPE_TM_BASE + 0x70000 + (p) * 0x10)
+#define   PPE_PORT_SHAPER_NEGATIVE	BIT(0)
+#define PPE_TM_PORT_SHAPER_CREDIT(p)	(PPE_TM_BASE + 0x72000 + (p) * 0x10)
+#define   PPE_PORT_SHAPER_CREDIT		GENMASK(29, 0)
+#define PPE_TM_PORT_SHAPER_CFG(p)		(PPE_TM_BASE + 0x74000 + (p) * 0x10)
+#define   PPE_PORT_SHAPER_REFRESH		GENMASK(17, 0)
+#define   PPE_PORT_SHAPER_DEPTH		GENMASK(31, 18)
+/* The following fields belong to the second configuration word. */
+#define   PPE_PORT_SHAPER_UNIT		GENMASK(2, 0)
+#define   PPE_PORT_SHAPER_PACKETS		BIT(3)
+#define   PPE_PORT_SHAPER_ENABLE		BIT(4)
+#define PPE_TM_PORT_SHAPER_METER(p)	(PPE_TM_BASE + 0x78000 + (p) * 0x10)
+#define   PPE_PORT_SHAPER_LENGTH		GENMASK(1, 0)
+#define   PPE_PORT_SHAPER_FRAME_CRC	1
 
 #define PPE_TM_PSCH_TDM(i)		(PPE_TM_BASE + 0x7a000 + (i) * 0x10)
 #define   PPE_PSCH_DES_PORT		GENMASK(3, 0)
@@ -365,6 +387,18 @@
 
 /* --- Queue Manager (base 0x800000) --- */
 #define PPE_QM_BASE			0x800000
+
+#define PPE_QM_FLUSH			(PPE_QM_BASE + 0x0)
+#define   PPE_QM_FLUSH_QUEUE		GENMASK(8, 0)
+#define   PPE_QM_FLUSH_STATUS		BIT(10)
+#define   PPE_QM_FLUSH_PORT		GENMASK(23, 21)
+#define   PPE_QM_FLUSH_ALL		BIT(24)
+#define   PPE_QM_FLUSH_BUSY		BIT(31)
+#define PPE_QM_DEFAULT_HASH		(PPE_QM_BASE + 0x60)
+#define   PPE_QM_HASH_OFFSET		GENMASK(7, 0)
+#define PPE_QM_PENDING_BUFFERS(q)	(PPE_QM_BASE + 0x4e000 + (q) * 0x10)
+#define   PPE_QM_PENDING_COUNT		GENMASK(11, 0)
+#define PPE_QM_ENQUEUE_DISABLE(q)	(PPE_QM_BASE + 0x5c000 + (q) * 0x10)
 
 #define PPE_QM_UCAST_MAP(i)		(PPE_QM_BASE + 0x10000 + (i) * 0x10)
 #define   PPE_QM_PROFILE_ID		GENMASK(3, 0)
@@ -511,6 +545,32 @@ struct qca_ppe_vlan_entry {
 
 /* Defined beside the MIB table that dimensions it. */
 struct qca_ppe_mib_stats;
+struct qca_ppe_tc;
+struct qca_ppe_rx_resource;
+struct ppe_tc_port;
+struct qdx_tc_peak_params;
+
+/* Native resource state, opaque to the TC policy owner. */
+struct qdx_tc_peak {
+	struct ppe_tc_port *owner;
+	struct qca_ppe_priv *priv;
+	struct clk *clock;
+	unsigned int port;
+	unsigned long hz;
+	u32 slot;
+	u32 original_cfg[2];
+	u32 original_credit;
+	u32 original_sign;
+	u32 original_meter;
+	u32 config[2];
+	u32 meter;
+	bool held;
+	bool prepared;
+	bool published;
+	bool retiring;
+	bool restored;
+	int error;
+};
 
 /* Latest native configuration, retained across NSS terminal recovery. */
 struct qca_ppe_port_config {
@@ -532,6 +592,19 @@ struct qca_ppe_port_config {
 
 struct qca_ppe_priv {
 	struct qdx_ppe *qdx;
+	struct qca_ppe_tc *tc;
+	/* Native port config locks precede this actual hardware resource lock. */
+	struct mutex resource_lock;
+	struct qca_ppe_rx_resource *rx_resources[QCA_PPE_MAX_PORTS];
+	struct qdx_tc_peak *peak_resources[QCA_PPE_MAX_PORTS];
+	struct list_head tx_uses;
+	unsigned int tx_holds[QCA_PPE_MAX_PORTS];
+	u32 tx_dequeue[QCA_PPE_MAX_PORTS][PPE_MAX_PORT_QUEUES];
+	u32 tx_enqueue[QCA_PPE_MAX_PORTS][PPE_MAX_PORT_QUEUES];
+	bool tx_saved[QCA_PPE_MAX_PORTS];
+	bool tx_bridge_enabled[QCA_PPE_MAX_PORTS];
+	bool tx_bridge_owned[QCA_PPE_MAX_PORTS];
+	bool resources_terminal;
 	struct qca_ppe_port_config port_config[QCA_PPE_MAX_PORTS];
 	struct dsa_switch ds;
 	struct regmap *regmap;
@@ -572,6 +645,23 @@ static inline struct qca_ppe_priv *ds_to_priv(struct dsa_switch *ds)
 }
 
 void ppe_scheduler_init(struct qca_ppe_priv *priv);
+void ppe_qdx_resources_init(struct qca_ppe_priv *priv);
+int ppe_qdx_resources_reapply(struct qca_ppe_priv *priv, unsigned int port);
+int ppe_qdx_resources_restore(struct qca_ppe_priv *priv);
+struct qdx_ppe_rx *ppe_qdx_rx_acquire(void *context, unsigned int port);
+int ppe_qdx_rx_hold(void *context, struct qdx_ppe_rx *scope);
+int ppe_qdx_rx_release(void *context, struct qdx_ppe_rx *scope);
+struct qdx_ppe_tx *ppe_qdx_tx_prepare(void *context, unsigned int port, u16 queue);
+int ppe_qdx_tx_hold(void *context, struct qdx_ppe_tx *scope);
+void ppe_qdx_tx_release(void *context, struct qdx_ppe_tx *scope);
+bool ppe_qdx_port_tx_held(struct qca_ppe_priv *priv, unsigned int port);
+int ppe_qdx_tx_queue_retry(struct qca_ppe_priv *priv, unsigned int port, u16 queue);
+bool ppe_qdx_tx_queue_busy(struct qca_ppe_priv *priv, unsigned int port, u16 queue);
+int ppe_qdx_peak_prepare(struct qca_ppe_priv *priv, unsigned int port,
+			 const struct qdx_tc_peak_params *params,
+			 struct qdx_tc_peak **result);
+int ppe_qdx_peak_publish(struct qdx_tc_peak *peak);
+int ppe_qdx_peak_release(struct qdx_tc_peak *peak);
 
 int ppe_vsi_alloc(struct qca_ppe_priv *priv);
 void ppe_vsi_free(struct qca_ppe_priv *priv, u32 vsi);

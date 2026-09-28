@@ -1,0 +1,90 @@
+From: Codex <noreply@openai.com>
+Date: Mon, 14 Sep 2026 20:00:00 +0000
+Subject: [PATCH] net: gso: preserve head TTL and hop limit on every segment
+
+UDP fraglist GRO retains each input packet's network header. Forwarding
+updates the aggregate head header, but skb_segment_list copies only the
+MAC and tunnel headers onto its child skbs. The UDP list fixup propagates
+NAT addresses and ports, while the IP callbacks update lengths and the
+IPv4 checksum. Child packets can therefore retain the input TTL or hop
+limit after routing.
+
+Save the current network header's TTL or hop limit before protocol
+segmentation, then assign it to every resulting segment. This propagates
+the value already selected by the native forwarding or output path; it
+does not perform another routing decrement. IPv4 checksum recalculation
+remains after the assignment. Keep all existing allocation, segmentation,
+jumbo-option and error paths unchanged.
+
+The IPv4 defect matches a routed 22-byte UDP population on Linux 6.18.44:
+5676 original packets retained TTL64 at CPU EDMA entry and at the receiver,
+with matching payloads and valid received checksums. The capture did not
+record GRO parent-child membership. IPv6 is covered because its UDP list
+segment path has the same omission; no IPv6 runtime pass is claimed.
+
+This is an original local fix against the actual 6.18.44 source, not an
+upstream backport. Pinned mainline 587858367581b9c55c3690f4e63382ad622719d4
+also lacks these assignments.
+
+Signed-off-by: Codex <noreply@openai.com>
+---
+ net/ipv4/af_inet.c     | 4 ++++
+ net/ipv6/ip6_offload.c | 4 ++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -1362,6 +1362,7 @@
+ 	int nhoff;
+ 	int ihl;
+ 	int id;
++	u8 ttl;
+ 
+ 	skb_reset_network_header(skb);
+ 	nhoff = skb_network_header(skb) - skb_mac_header(skb);
+@@ -1375,6 +1376,7 @@
+ 
+ 	id = ntohs(iph->id);
+ 	proto = iph->protocol;
++	ttl = iph->ttl;
+ 
+ 	/* Warning: after this point, iph might be no longer valid */
+ 	if (unlikely(!pskb_may_pull(skb, ihl)))
+@@ -1410,6 +1412,8 @@
+ 	skb = segs;
+ 	do {
+ 		iph = (struct iphdr *)(skb_mac_header(skb) + nhoff);
++		/* Fraglist segments retain their original IP headers. */
++		iph->ttl = ttl;
+ 		if (udpfrag) {
+ 			iph->frag_off = htons(offset >> 3);
+ 			if (skb->next)
+diff --git a/net/ipv6/ip6_offload.c b/net/ipv6/ip6_offload.c
+--- a/net/ipv6/ip6_offload.c
++++ b/net/ipv6/ip6_offload.c
+@@ -114,6 +114,7 @@
+ 	struct frag_hdr *fptr;
+ 	unsigned int payload_len;
+ 	u8 *prevhdr;
++	u8 hop_limit;
+ 	int offset = 0;
+ 	bool encap, udpfrag;
+ 	int nhoff;
+@@ -133,6 +134,7 @@
+ 	SKB_GSO_CB(skb)->encap_level += sizeof(*ipv6h);
+ 
+ 	ipv6h = ipv6_hdr(skb);
++	hop_limit = ipv6h->hop_limit;
+ 	__skb_pull(skb, sizeof(*ipv6h));
+ 	segs = ERR_PTR(-EPROTONOSUPPORT);
+ 
+@@ -163,6 +165,8 @@
+ 
+ 	for (skb = segs; skb; skb = skb->next) {
+ 		ipv6h = (struct ipv6hdr *)(skb_mac_header(skb) + nhoff);
++		/* Fraglist segments retain their original IP headers. */
++		ipv6h->hop_limit = hop_limit;
+ 		if (gso_partial && skb_is_gso(skb))
+ 			payload_len = skb_shinfo(skb)->gso_size +
+ 				      SKB_GSO_CB(skb)->data_offset +

@@ -1,0 +1,6 @@
+config QDX_BRIDGE
+	tristate "QDX bridge path integration"
+	depends on QDX && BRIDGE && NET_SWITCHDEV
+	help
+	  Track the native bridge decisions used by QDX delegated paths.
+	  Native bridge forwarding and FDB policy remain with the bridge owner.

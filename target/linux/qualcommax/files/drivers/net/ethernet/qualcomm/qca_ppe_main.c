@@ -14,6 +14,10 @@
 #include <linux/if_bridge.h>
 #include <linux/if_vlan.h>
 #include <linux/version.h>
+#include <linux/dsa/oob.h>
+#include <linux/qdx/tc.h>
+#include <net/pkt_cls.h>
+#include <net/sch_generic.h>
 
 #include "qca_ppe.h"
 
@@ -61,9 +65,14 @@ static void ppe_port_xgmac_set(struct qca_ppe_priv *priv, int port,
 static void ppe_port_bridge_txmac_set(struct qca_ppe_priv *priv, int port,
 				      bool enable)
 {
+	mutex_lock(&priv->resource_lock);
+	priv->tx_bridge_enabled[port] = enable;
+	if (priv->tx_holds[port])
+		enable = false;
 	regmap_update_bits(priv->regmap, PPE_PORT_BRIDGE_CTRL(port),
 			   PPE_PORT_BRIDGE_CTRL_TXMAC_EN,
 			   enable ? PPE_PORT_BRIDGE_CTRL_TXMAC_EN : 0);
+	mutex_unlock(&priv->resource_lock);
 }
 
 static void ppe_gmac_link_up(struct qca_ppe_priv *priv, int port,
@@ -156,19 +165,31 @@ static void ppe_xgmac_link_up(struct qca_ppe_priv *priv, int port,
 			  rx_pause ? PPE_XGMAC_RX_FLOW_ENABLE : 0);
 }
 
-static void ppe_port_cnt_enable(struct qca_ppe_priv *priv, int port)
+static int ppe_port_cnt_enable(struct qca_ppe_priv *priv, int port)
 {
-	regmap_update_bits(priv->regmap,
-			   PPE_MRU_MTU_CTRL(port,
-					    priv->data->mru_mtu_ctrl_stride) + 4,
-			   PPE_MRU_MTU_CTRL_RX_CNT_EN | PPE_MRU_MTU_CTRL_TX_CNT_EN,
-			   PPE_MRU_MTU_CTRL_RX_CNT_EN | PPE_MRU_MTU_CTRL_TX_CNT_EN);
+	u32 reg = PPE_MRU_MTU_CTRL(port, priv->data->mru_mtu_ctrl_stride);
+	u32 row[2];
+	int ret;
 
-	regmap_update_bits(priv->regmap, PPE_MC_MTU_CTRL(port),
-			   PPE_MC_MTU_CTRL_TX_CNT_EN, PPE_MC_MTU_CTRL_TX_CNT_EN);
+	mutex_lock(&priv->resource_lock);
+	ret = regmap_bulk_read(priv->regmap, reg, row, ARRAY_SIZE(row));
+	if (ret)
+		goto out;
+	row[1] |= PPE_MRU_MTU_CTRL_RX_CNT_EN | PPE_MRU_MTU_CTRL_TX_CNT_EN;
+	ret = regmap_bulk_write(priv->regmap, reg, row, ARRAY_SIZE(row));
+	if (ret)
+		goto out;
 
-	regmap_update_bits(priv->regmap, PPE_PORT_EG_VLAN(port),
-			   PPE_PORT_EG_VLAN_TX_CNT_EN, PPE_PORT_EG_VLAN_TX_CNT_EN);
+	ret = regmap_update_bits(priv->regmap, PPE_MC_MTU_CTRL(port),
+				 PPE_MC_MTU_CTRL_TX_CNT_EN, PPE_MC_MTU_CTRL_TX_CNT_EN);
+	if (ret)
+		goto out;
+
+	ret = regmap_update_bits(priv->regmap, PPE_PORT_EG_VLAN(port),
+				 PPE_PORT_EG_VLAN_TX_CNT_EN, PPE_PORT_EG_VLAN_TX_CNT_EN);
+out:
+	mutex_unlock(&priv->resource_lock);
+	return ret;
 }
 
 int ppe_vsi_alloc(struct qca_ppe_priv *priv)
@@ -455,7 +476,8 @@ static int qca_ppe_setup(struct dsa_switch *ds)
 	u32 frame_size;
 	u32 port_mask;
 	u32 val;
-	int i;
+	u32 row[2];
+	int i, ret;
 
 	port_mask = BIT(num_ports) - 1;
 	frame_size = PPE_DEFAULT_MTU + 2 * VLAN_HLEN;
@@ -466,13 +488,20 @@ static int qca_ppe_setup(struct dsa_switch *ds)
 	regmap_write(priv->regmap, PPE_FDB_OP, 0);
 
 	for (i = 0; i < num_ports; i++) {
+		u32 reg = PPE_MRU_MTU_CTRL(i, priv->data->mru_mtu_ctrl_stride);
+
 		regmap_write(priv->regmap, PPE_CST_STATE(i), PPE_STP_FORWARDING);
 
-		regmap_write(priv->regmap,
-			     PPE_MRU_MTU_CTRL(i,
-					      priv->data->mru_mtu_ctrl_stride),
-			     FIELD_PREP(PPE_MRU_MTU_CTRL_MRU, frame_size) |
-			     FIELD_PREP(PPE_MRU_MTU_CTRL_MTU, frame_size));
+		mutex_lock(&priv->resource_lock);
+		ret = regmap_bulk_read(priv->regmap, reg, row, ARRAY_SIZE(row));
+		if (!ret) {
+			row[0] = FIELD_PREP(PPE_MRU_MTU_CTRL_MRU, frame_size) |
+				 FIELD_PREP(PPE_MRU_MTU_CTRL_MTU, frame_size);
+			ret = regmap_bulk_write(priv->regmap, reg, row, ARRAY_SIZE(row));
+		}
+		mutex_unlock(&priv->resource_lock);
+		if (ret)
+			return ret;
 
 		regmap_update_bits(priv->regmap, PPE_MC_MTU_CTRL(i),
 				   PPE_MC_MTU_CTRL_MTU,
@@ -495,7 +524,9 @@ static int qca_ppe_setup(struct dsa_switch *ds)
 				   PPE_PORT_BRIDGE_CTRL_TXMAC_EN,
 				   val);
 
-		ppe_port_cnt_enable(priv, i);
+		ret = ppe_port_cnt_enable(priv, i);
+		if (ret)
+			return ret;
 	}
 
 	qca_ppe_vlan_setup(ds);
@@ -547,9 +578,10 @@ static int ppe_port_mtu_apply(struct qca_ppe_priv *priv, int port, int mtu)
 	u32 previous[2], values[2];
 	int ret;
 
+	mutex_lock(&priv->resource_lock);
 	ret = regmap_bulk_read(priv->regmap, reg, previous, ARRAY_SIZE(previous));
 	if (ret)
-		return ret;
+		goto out;
 	values[0] = previous[0] & ~(PPE_MRU_MTU_CTRL_MRU | PPE_MRU_MTU_CTRL_MTU);
 	values[0] |= FIELD_PREP(PPE_MRU_MTU_CTRL_MRU, size) |
 		     FIELD_PREP(PPE_MRU_MTU_CTRL_MTU, size);
@@ -557,11 +589,13 @@ static int ppe_port_mtu_apply(struct qca_ppe_priv *priv, int port, int mtu)
 	/* The final word commits this table entry, even when unchanged. */
 	ret = regmap_bulk_write(priv->regmap, reg, values, ARRAY_SIZE(values));
 	if (ret)
-		return ret;
+		goto out;
 	ret = regmap_update_bits(priv->regmap, PPE_MC_MTU_CTRL(port),
 			PPE_MC_MTU_CTRL_MTU, FIELD_PREP(PPE_MC_MTU_CTRL_MTU, size));
 	if (ret)
 		regmap_bulk_write(priv->regmap, reg, previous, ARRAY_SIZE(previous));
+out:
+	mutex_unlock(&priv->resource_lock);
 	return ret;
 }
 
@@ -779,7 +813,7 @@ static void qca_ppe_port_bridge_leave(struct dsa_switch *ds, int port,
 {
 	struct qca_ppe_priv *priv = ds_to_priv(ds);
 	struct qca_ppe_bridge_vsi *bvsi;
-	int ret;
+	int ret, vsi_ret = 0;
 
 	bvsi = bridge_vsi_find(priv, bridge.dev);
 	if (!bvsi)
@@ -788,13 +822,22 @@ static void qca_ppe_port_bridge_leave(struct dsa_switch *ds, int port,
 	ret = qdx_port_prepare(priv->qdx, port);
 	priv->port_vsi[port] = PPE_VSI_INVALID;
 	priv->port_br_dev[port] = NULL;
-	priv->port_config[port].vsi = PPE_VSI_INVALID;
+	/* setup reserves VSI 0 for standalone ports and floods only to CPU.
+	 * port_vsi stays INVALID because the port belongs to no bridge.
+	 */
+	priv->port_config[port].vsi = 0;
 	if (!ret)
-		ppe_port_vsi_set(priv, port, PPE_VSI_INVALID);
+		vsi_ret = ppe_port_vsi_set(priv, port, 0);
 	bridge_vsi_members_update(priv, bvsi);
 	bridge_vsi_put(priv, bvsi);
-	if (!ret)
+	if (!ret) {
+		if (vsi_ret)
+			qdx_port_failed(priv->qdx, port, vsi_ret);
+		/* Successful prepare owns the port lock, including update failures. */
 		ret = qdx_port_finish(priv->qdx, port);
+		if (vsi_ret)
+			ret = vsi_ret;
+	}
 	if (ret) {
 		ppe_port_bridge_txmac_set(priv, port, false);
 		qdx_port_failed(priv->qdx, port, ret);
@@ -1968,6 +2011,1026 @@ static int ppe_ipq6018_mux_setup(struct qca_ppe_priv *priv)
 	return 0;
 }
 
+/* Fixed native queue identity and its separately retired execution tokens. */
+#define PPE_TC_NORMAL_QUEUES 1
+#define PPE_TC_CLASS_QUEUES 64
+#define PPE_TC_QUEUES (PPE_TC_NORMAL_QUEUES + PPE_TC_CLASS_QUEUES)
+
+struct ppe_tc_port;
+struct ppe_tc_execution {
+	struct list_head list;
+	struct qdx_tc_queue *slot;
+	refcount_t refs;
+	struct qdx_tx_path *path;
+	struct qdx_tx_class class;
+	enum qdx_disposition disposition;
+	bool retired;
+	bool held;
+	bool stopped;
+	int stop_error;
+	bool base_path;
+	bool native_return;
+	bool handback_pending;
+};
+
+struct qdx_tc_queue {
+	struct ppe_tc_port *port;
+	struct mutex cfg;
+	struct qdx_tc_queue_owner origin;
+	struct qdx_tc_queue_owner claim;
+	struct list_head executions;
+	struct ppe_tc_execution *active_execution;
+	u16 qid;
+	bool claimed;
+	bool exposed;
+};
+
+struct ppe_tc_block {
+	struct list_head list;
+	struct ppe_tc_port *port;
+	struct tcf_block *native;
+	enum flow_block_binder_type binder;
+	struct flow_block_cb *callback;
+	bool unbinding;
+};
+
+struct ppe_tc_root {
+	struct list_head list;
+	struct Qdisc *identity;
+	struct qdx_binding *provider;
+};
+
+struct ppe_tc_port {
+	struct qca_ppe_priv *priv;
+	unsigned int number;
+	struct qdx_binding *binding;
+	struct net_device *dev;
+	refcount_t refs;
+	wait_queue_head_t drained;
+	struct list_head blocks;
+	struct list_head roots;
+	struct qdx_tc_queue *slots[PPE_TC_QUEUES];
+	bool closing;
+};
+
+struct qca_ppe_tc {
+	spinlock_t lock;
+	struct dsa_switch_ops ops;
+	struct notifier_block netdev;
+	bool notifier_registered;
+	bool native_gone;
+	struct ppe_tc_port ports[QCA_PPE_MAX_PORTS];
+};
+
+static LIST_HEAD(ppe_tc_block_callbacks);
+
+static bool ppe_tc_port_get(void *object)
+{
+	struct ppe_tc_port *port = object;
+
+	return refcount_inc_not_zero(&port->refs);
+}
+
+static void ppe_tc_port_put(void *object)
+{
+	struct ppe_tc_port *port = object;
+
+	spin_lock_bh(&port->priv->tc->lock);
+	refcount_dec(&port->refs);
+	wake_up_all(&port->drained);
+	spin_unlock_bh(&port->priv->tc->lock);
+}
+
+static bool ppe_tc_execution_get(void *object)
+{
+	struct ppe_tc_execution *execution = object;
+
+	if (!refcount_inc_not_zero(&execution->refs))
+		return false;
+	qdx_tx_path_get(execution->path);
+	return true;
+}
+
+static void ppe_tc_execution_put(void *object)
+{
+	struct ppe_tc_execution *execution = object;
+
+	/* A returned selection owns this exact path independently of retirement. */
+	qdx_tx_path_put(execution->path);
+	refcount_dec(&execution->refs);
+}
+
+static bool ppe_tc_queue_cached(struct qdx_tc_queue *slot, struct Qdisc *root)
+{
+	struct sk_buff *skb;
+	bool busy = false;
+
+	if (!root || root->flags & TCQ_F_BUILTIN)
+		return false;
+	/* Caller holds the public native root lock through its identity update. */
+	if (qdisc_is_running(root))
+		return true;
+	skb_queue_walk(&root->gso_skb, skb) {
+		if (skb_get_queue_mapping(skb) == slot->qid) {
+			busy = true;
+			break;
+		}
+	}
+	if (!busy)
+		skb_queue_walk(&root->skb_bad_txq, skb) {
+			if (skb_get_queue_mapping(skb) == slot->qid) {
+				busy = true;
+				break;
+			}
+		}
+	return busy;
+}
+
+static int ppe_tc_queue_reserve(struct qdx_binding *binding,
+		const struct qdx_tc_queue_owner *owner, u16 requested,
+		struct qdx_tc_queue **result, u16 *queue)
+{
+	struct ppe_tc_port *port = qdx_binding_owner(binding);
+	struct qdx_tc_queue *slot;
+	unsigned int first, last, qid;
+	int error = -ENOSPC;
+
+	ASSERT_RTNL();
+	if (!owner || !owner->root || !result || !queue ||
+	    (requested != U16_MAX && requested >= PPE_TC_QUEUES) ||
+	    (!requested && owner->class))
+		return -EINVAL;
+	first = requested == U16_MAX ? PPE_TC_NORMAL_QUEUES : requested;
+	last = requested == U16_MAX ? PPE_TC_QUEUES : requested + 1;
+	slot = kzalloc(sizeof(*slot), GFP_KERNEL);
+	if (!slot)
+		return -ENOMEM;
+	slot->port = port;
+	slot->origin = *owner;
+	mutex_init(&slot->cfg);
+	INIT_LIST_HEAD(&slot->executions);
+	spin_lock_bh(&port->priv->tc->lock);
+	if (port->closing) {
+		error = -ESHUTDOWN;
+		goto unlock;
+	}
+	for (qid = first; qid < last; qid++) {
+		if (port->slots[qid])
+			continue;
+		port->slots[qid] = slot;
+		slot->qid = qid;
+		ppe_tc_port_get(port);
+		error = 0;
+		break;
+	}
+unlock:
+	spin_unlock_bh(&port->priv->tc->lock);
+	if (error) {
+		kfree(slot);
+		return error;
+	}
+	*result = slot;
+	*queue = slot->qid;
+	return 0;
+}
+
+static int ppe_tc_queue_claim(struct qdx_tc_queue *slot,
+			    const struct qdx_tc_queue_owner *owner)
+{
+	struct ppe_tc_port *port = slot->port;
+	spinlock_t *native_lock = NULL;
+	int error = 0;
+
+	ASSERT_RTNL();
+	if (owner && !owner->root)
+		return -EINVAL;
+	mutex_lock(&slot->cfg);
+	if (owner && slot->claimed &&
+	    (owner->root != slot->claim.root || owner->class != slot->claim.class)) {
+		if (ppe_qdx_tx_queue_busy(port->priv, port->number, slot->qid)) {
+			error = -EBUSY;
+			goto out;
+		}
+		native_lock = qdisc_lock(owner->root);
+		spin_lock_bh(native_lock);
+		if (ppe_tc_queue_cached(slot, owner->root)) {
+			error = -EBUSY;
+			goto out;
+		}
+	}
+	spin_lock_bh(&port->priv->tc->lock);
+	slot->claimed = !!owner;
+	if (owner)
+		slot->claim = *owner;
+	else
+		memset(&slot->claim, 0, sizeof(slot->claim));
+	spin_unlock_bh(&port->priv->tc->lock);
+out:
+	if (native_lock)
+		spin_unlock_bh(native_lock);
+	mutex_unlock(&slot->cfg);
+	return error;
+}
+
+static int ppe_tc_queue_activate(struct qdx_tc_queue *slot)
+{
+	struct net_device *dev = slot->port->dev;
+
+	ASSERT_RTNL();
+	if (READ_ONCE(slot->port->closing))
+		return -ESHUTDOWN;
+	if (slot->qid >= dev->num_tx_queues)
+		return -ERANGE;
+	if (slot->qid < dev->real_num_tx_queues)
+		return 0;
+	return netif_set_real_num_tx_queues(dev, slot->qid + 1);
+}
+
+static int ppe_tc_queue_execution_prepare(struct qdx_tc_queue *slot,
+		struct qdx_endpoint *endpoint, u32 tag,
+		enum qdx_disposition disposition, struct qdx_tx_path **path, u64 *token)
+{
+	struct ppe_tc_port *port = slot->port;
+	struct ppe_tc_execution *execution, *old, *next;
+	struct qdx_tx_path *prepared;
+	u64 next_token;
+	int error = 0;
+
+	if (disposition == QDX_NATIVE || disposition > QDX_REQUIRED)
+		return -EINVAL;
+	mutex_lock(&slot->cfg);
+	if (port->closing || (slot->active_execution && !slot->active_execution->retired)) {
+		error = -EBUSY;
+		goto out;
+	}
+	/* The old native qid remains reserved while execution changes. Each old
+	 * accepted path has to release its real resource before replacement.
+	 */
+	if (ppe_qdx_tx_queue_busy(port->priv, port->number, slot->qid)) {
+		error = -EAGAIN;
+		goto out;
+	}
+	spin_lock_bh(&port->priv->tc->lock);
+	list_for_each_entry(old, &slot->executions, list)
+		if (refcount_read(&old->refs) != 1) {
+			error = -EAGAIN;
+			break;
+		}
+	if (!error) {
+		list_for_each_entry_safe(old, next, &slot->executions, list) {
+			list_del(&old->list);
+			kfree(old);
+		}
+		slot->active_execution = NULL;
+	}
+	spin_unlock_bh(&port->priv->tc->lock);
+	if (error)
+		goto out;
+	execution = kzalloc(sizeof(*execution), GFP_KERNEL);
+	if (!execution) {
+		error = -ENOMEM;
+		goto out;
+	}
+	next_token = qdx_ppe_next_tx_token(port->priv->qdx);
+	if (!next_token) {
+		error = -ESHUTDOWN;
+		goto free;
+	}
+	execution->class = (struct qdx_tx_class) { .tag = tag, .token = next_token };
+	prepared = qdx_tx_prepare(endpoint, port->dev, slot->qid, execution->class,
+				 disposition);
+	if (IS_ERR(prepared)) {
+		error = PTR_ERR(prepared);
+		goto free;
+	}
+	execution->slot = slot;
+	execution->path = prepared;
+	execution->disposition = disposition;
+	execution->held = true;
+	execution->base_path = true;
+	refcount_set(&execution->refs, 1);
+	qdx_tx_path_get(prepared); /* The caller owns the original prepare reference. */
+	spin_lock_bh(&port->priv->tc->lock);
+	list_add_tail(&execution->list, &slot->executions);
+	slot->active_execution = execution;
+	spin_unlock_bh(&port->priv->tc->lock);
+	*path = prepared;
+	*token = execution->class.token;
+	goto out;
+free:
+	kfree(execution);
+out:
+	mutex_unlock(&slot->cfg);
+	return error;
+}
+
+static int ppe_tc_queue_publish(struct qdx_tc_queue *slot, struct qdx_tx_path *path)
+{
+	struct ppe_tc_port *port = slot->port;
+	int error = 0;
+
+	mutex_lock(&slot->cfg);
+	qdx_ppe_tx_gate(port->priv->qdx, true);
+	spin_lock_bh(&port->priv->tc->lock);
+	if (port->closing || !slot->active_execution || slot->active_execution->path != path ||
+	    slot->active_execution->retired || slot->active_execution->stopped ||
+	    slot->qid >= port->dev->real_num_tx_queues)
+		error = -ESTALE;
+	else {
+		slot->active_execution->held = false;
+		slot->exposed = true;
+	}
+	spin_unlock_bh(&port->priv->tc->lock);
+	qdx_ppe_tx_gate(port->priv->qdx, false);
+	mutex_unlock(&slot->cfg);
+	return error;
+}
+
+static int ppe_tc_queue_hold(struct qdx_tc_queue *slot)
+{
+	struct ppe_tc_port *port = slot->port;
+	struct ppe_tc_execution *execution;
+	int error = 0;
+
+	mutex_lock(&slot->cfg);
+	qdx_ppe_tx_gate(port->priv->qdx, true);
+	spin_lock_bh(&port->priv->tc->lock);
+	execution = slot->active_execution;
+	if (execution) {
+		execution->held = true;
+		execution->stopped = true;
+	}
+	spin_unlock_bh(&port->priv->tc->lock);
+	if (execution && execution->base_path)
+		error = qdx_tx_hold(execution->path);
+	if (execution && !execution->base_path) {
+		error = execution->stop_error;
+		if (error && !ppe_qdx_tx_queue_busy(port->priv, port->number, slot->qid))
+			error = 0;
+	}
+	if (execution) {
+		spin_lock_bh(&port->priv->tc->lock);
+		execution->stop_error = error;
+		spin_unlock_bh(&port->priv->tc->lock);
+	}
+	qdx_ppe_tx_gate(port->priv->qdx, false);
+	mutex_unlock(&slot->cfg);
+	return error;
+}
+
+static int ppe_tc_queue_retire(struct qdx_tc_queue *slot)
+{
+	struct ppe_tc_port *port = slot->port;
+	struct ppe_tc_execution *execution;
+	struct qdx_tx_path *path = NULL;
+	int error = 0, cleanup;
+	bool pending;
+
+	mutex_lock(&slot->cfg);
+	qdx_ppe_tx_gate(port->priv->qdx, true);
+	spin_lock_bh(&port->priv->tc->lock);
+	execution = slot->active_execution;
+	if (execution) {
+		execution->held = true;
+		execution->retired = true;
+		execution->stopped = true;
+		if (execution->base_path) {
+			path = execution->path;
+			execution->handback_pending =
+				execution->disposition == QDX_OPTIONAL && !port->closing;
+		}
+	}
+	spin_unlock_bh(&port->priv->tc->lock);
+	if (path)
+		error = qdx_tx_hold(path);
+	else if (execution)
+		error = execution->stop_error;
+	spin_lock_bh(&port->priv->tc->lock);
+	if (path) {
+		execution->stop_error = error;
+		execution->base_path = false;
+	}
+	spin_unlock_bh(&port->priv->tc->lock);
+	if (path)
+		qdx_tx_release(path);
+	/* A retained native claim can outlive this execution. Retry its exact
+	 * orphan scope here as well as at final slot release.
+	 */
+	cleanup = ppe_qdx_tx_queue_retry(port->priv, port->number, slot->qid);
+	if (!error)
+		error = cleanup;
+	pending = ppe_qdx_tx_queue_busy(port->priv, port->number, slot->qid);
+	if (execution) {
+		spin_lock_bh(&port->priv->tc->lock);
+		execution->handback_pending = execution->disposition == QDX_OPTIONAL &&
+			!port->closing && pending;
+		if (!cleanup && !pending) {
+			execution->stop_error = 0;
+			execution->native_return = execution->disposition == QDX_OPTIONAL &&
+				!ppe_qdx_port_tx_held(port->priv, port->number);
+			error = 0;
+		}
+		spin_unlock_bh(&port->priv->tc->lock);
+	}
+	/* The caller retains its resource-progress subscription until this exact
+	 * scope is gone and the original execution's handback is recorded.
+	 */
+	if (!error && pending)
+		error = -EINPROGRESS;
+	qdx_ppe_tx_gate(port->priv->qdx, false);
+	mutex_unlock(&slot->cfg);
+	return error;
+}
+
+static int ppe_tc_queue_release(struct qdx_tc_queue *slot, struct Qdisc *current_root)
+{
+	struct ppe_tc_port *port = slot->port;
+	struct ppe_tc_execution *execution, *next;
+	unsigned int floor = PPE_TC_NORMAL_QUEUES, i;
+	spinlock_t *native_lock = NULL;
+	int error = -EINPROGRESS;
+
+	ASSERT_RTNL();
+	mutex_lock(&slot->cfg);
+	if (slot->claimed || (slot->active_execution && !slot->active_execution->retired) ||
+	    (slot->exposed && !slot->origin.class && current_root == slot->origin.root))
+		goto out;
+	error = ppe_qdx_tx_queue_retry(port->priv, port->number, slot->qid);
+	if (error)
+		goto out;
+	error = -EINPROGRESS;
+	if (ppe_qdx_tx_queue_busy(port->priv, port->number, slot->qid))
+		goto out;
+	synchronize_net();
+	if (current_root && !(current_root->flags & TCQ_F_BUILTIN)) {
+		native_lock = qdisc_lock(current_root);
+		spin_lock_bh(native_lock);
+		if (ppe_tc_queue_cached(slot, current_root))
+			goto out;
+	}
+	spin_lock_bh(&port->priv->tc->lock);
+	list_for_each_entry(execution, &slot->executions, list)
+		if (execution->base_path || refcount_read(&execution->refs) != 1)
+			goto unlock;
+	port->slots[slot->qid] = NULL;
+	list_for_each_entry_safe(execution, next, &slot->executions, list) {
+		list_del(&execution->list);
+		kfree(execution);
+	}
+	for (i = PPE_TC_NORMAL_QUEUES; i < PPE_TC_QUEUES; i++)
+		if (port->slots[i])
+			floor = i + 1;
+	error = 0;
+unlock:
+	spin_unlock_bh(&port->priv->tc->lock);
+out:
+	if (native_lock)
+		spin_unlock_bh(native_lock);
+	mutex_unlock(&slot->cfg);
+	if (error)
+		return error;
+	/* This call is outside TC cfg. A failed shrink keeps the larger prefix;
+	 * it cannot restore the removed class or compact a still-retiring slot.
+	 */
+	if (port->dev->reg_state == NETREG_REGISTERED &&
+	    floor < port->dev->real_num_tx_queues)
+		netif_set_real_num_tx_queues(port->dev, floor);
+	kfree(slot);
+	ppe_tc_port_put(port);
+	return 0;
+}
+
+static const struct qdx_tc_queue_ops ppe_tc_queue_ops = {
+	.reserve = ppe_tc_queue_reserve,
+	.claim = ppe_tc_queue_claim,
+	.activate = ppe_tc_queue_activate,
+	.execution_prepare = ppe_tc_queue_execution_prepare,
+	.publish = ppe_tc_queue_publish,
+	.hold = ppe_tc_queue_hold,
+	.retire = ppe_tc_queue_retire,
+	.release = ppe_tc_queue_release,
+};
+
+static int ppe_tc_block_call(enum tc_setup_type type, void *data, void *context)
+{
+	const struct qdx_binding_key key = { .role = QDX_BINDING_TC_PROVIDER };
+	struct ppe_tc_block *block = context;
+	struct qdx_binding *provider;
+	const struct qdx_tc_ops *ops;
+	struct flow_block_offload bind = {
+		.command = FLOW_BLOCK_BIND, .binder_type = block->binder,
+		.native_block = block->native,
+	};
+	int error;
+
+	/* Removal reaches the same peer before any new-HW admission checks. */
+	if (!block->port->binding)
+		return -EOPNOTSUPP;
+	provider = qdx_binding_lookup(&key);
+	if (IS_ERR_OR_NULL(provider))
+		return provider ? PTR_ERR(provider) : -EOPNOTSUPP;
+	ops = qdx_binding_ops(provider);
+	if (type != TC_SETUP_BLOCK && !block->unbinding) {
+		/* Replay or ordinary requests can attach a later-loaded peer to this
+		 * existing native callback. This creates no native callback/count.
+		 */
+		error = ops->setup_block(provider, block->port->binding, block->native,
+					 block->binder, TC_SETUP_BLOCK, &bind);
+		if (error)
+			goto out;
+	}
+	error = ops->setup_block(provider, block->port->binding, block->native,
+				 block->binder, type, data);
+out:
+	qdx_binding_put(provider);
+	return error;
+}
+
+static void ppe_tc_block_free(void *context)
+{
+	struct ppe_tc_block *block = context;
+	struct ppe_tc_port *port = block->port;
+	struct flow_block_offload unbind = {
+		.command = FLOW_BLOCK_UNBIND, .binder_type = block->binder,
+		.native_block = block->native,
+	};
+
+	ppe_tc_block_call(TC_SETUP_BLOCK, &unbind, block);
+	list_del(&block->list);
+	ppe_tc_port_put(port);
+	kfree(block);
+}
+
+static int ppe_tc_setup_block(struct dsa_switch *ds, int number,
+			     struct flow_block_offload *offload)
+{
+	struct qca_ppe_priv *priv = ds->priv;
+	struct ppe_tc_port *port = &priv->tc->ports[number];
+	struct ppe_tc_block *block;
+	struct flow_block_cb *callback;
+	int error;
+
+	ASSERT_RTNL();
+	if (!offload->native_block ||
+	    (offload->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS &&
+	     offload->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_EGRESS &&
+	     offload->binder_type != FLOW_BLOCK_BINDER_TYPE_UNSPEC))
+		return -EOPNOTSUPP;
+	offload->driver_block_list = &ppe_tc_block_callbacks;
+	list_for_each_entry(block, &port->blocks, list)
+		if (block->native == offload->native_block &&
+		    block->binder == offload->binder_type)
+			goto found;
+	block = NULL;
+found:
+	switch (offload->command) {
+	case FLOW_BLOCK_BIND:
+		if (block)
+			return -EBUSY;
+		if (port->closing)
+			return -ESHUTDOWN;
+		block = kzalloc(sizeof(*block), GFP_KERNEL);
+		if (!block)
+			return -ENOMEM;
+		block->port = port;
+		block->native = offload->native_block;
+		block->binder = offload->binder_type;
+		callback = flow_block_cb_alloc(ppe_tc_block_call, block, block,
+					      ppe_tc_block_free);
+		if (IS_ERR(callback)) {
+			kfree(block);
+			return PTR_ERR(callback);
+		}
+		block->callback = callback;
+		ppe_tc_port_get(port);
+		list_add_tail(&block->list, &port->blocks);
+		error = ppe_tc_block_call(TC_SETUP_BLOCK, offload, block);
+		if (error && error != -EOPNOTSUPP) {
+			flow_block_cb_free(callback);
+			return error;
+		}
+		flow_block_cb_add(callback, offload);
+		list_add_tail(&callback->driver_list, &ppe_tc_block_callbacks);
+		return 0;
+	case FLOW_BLOCK_UNBIND:
+		if (!block)
+			return -ENOENT;
+		block->unbinding = true;
+		flow_block_cb_remove(block->callback, offload);
+		list_del(&block->callback->driver_list);
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static int ppe_tc_replay(struct qdx_binding *binding, struct tcf_block *native,
+		       enum flow_block_binder_type binder, bool add,
+		       struct netlink_ext_ack *extack)
+{
+	struct ppe_tc_port *port = qdx_binding_owner(binding);
+	struct flow_block_offload offer = {
+		.command = FLOW_BLOCK_BIND, .binder_type = binder,
+		.native_block = native,
+	};
+	struct ppe_tc_block *block;
+	int error;
+
+	ASSERT_RTNL();
+	list_for_each_entry(block, &port->blocks, list) {
+		if (block->native != native || block->binder != binder || block->unbinding)
+			continue;
+		error = ppe_tc_block_call(TC_SETUP_BLOCK, &offer, block);
+		if (error)
+			return error;
+#ifdef CONFIG_NET_CLS
+		return tcf_block_replay_bound(native, ppe_tc_block_call,
+					     block, add, extack);
+#else
+		return -EOPNOTSUPP;
+#endif
+	}
+	return -ENOENT;
+}
+
+static int ppe_tc_peak_prepare(struct qdx_binding *binding,
+			       const struct qdx_tc_peak_params *params,
+			       struct qdx_tc_peak **result)
+{
+	struct ppe_tc_port *port = qdx_binding_owner(binding);
+	int error;
+
+	ASSERT_RTNL();
+	*result = NULL;
+	if (port->closing || !dsa_is_user_port(&port->priv->ds, port->number) ||
+	    !ppe_tc_port_get(port))
+		return -ESHUTDOWN;
+	error = ppe_qdx_peak_prepare(port->priv, port->number, params, result);
+	if (*result)
+		(*result)->owner = port;
+	else
+		ppe_tc_port_put(port);
+	return error;
+}
+
+static int ppe_tc_peak_publish(struct qdx_tc_peak *peak)
+{
+	ASSERT_RTNL();
+	if (READ_ONCE(peak->owner->closing))
+		return -ESHUTDOWN;
+	return ppe_qdx_peak_publish(peak);
+}
+
+static int ppe_tc_peak_release(struct qdx_tc_peak *peak)
+{
+	struct ppe_tc_port *port = peak->owner;
+	int error;
+
+	ASSERT_RTNL();
+	/* Closing/terminal stops creation, not restoration of this exact owner. */
+	error = ppe_qdx_peak_release(peak);
+	if (!error)
+		ppe_tc_port_put(port);
+	return error;
+}
+
+static const struct qdx_tc_port_ops ppe_tc_port_ops = {
+	.normal_direct_count = PPE_TC_NORMAL_QUEUES,
+	.queues = &ppe_tc_queue_ops,
+	.replay = ppe_tc_replay,
+	.peak_prepare = ppe_tc_peak_prepare,
+	.peak_publish = ppe_tc_peak_publish,
+	.peak_release = ppe_tc_peak_release,
+};
+
+static int ppe_tc_setup(struct dsa_switch *ds, int number,
+		       enum tc_setup_type type, void *data)
+{
+	const struct qdx_binding_key key = { .role = QDX_BINDING_TC_PROVIDER };
+	struct qca_ppe_priv *priv = ds->priv;
+	struct ppe_tc_port *port = &priv->tc->ports[number];
+	struct tc_htb_qopt_offload *htb = type == TC_SETUP_QDISC_HTB ? data : NULL;
+	struct ppe_tc_root *root = NULL, *entry, *created = NULL;
+	struct qdx_binding *provider;
+	const struct qdx_tc_ops *ops;
+	int error;
+
+	ASSERT_RTNL();
+	if (!port->binding)
+		return -EOPNOTSUPP;
+	if (htb)
+		list_for_each_entry(entry, &port->roots, list)
+			if (entry->identity == htb->owner.sch) {
+				root = entry;
+				break;
+			}
+	if (root) {
+		provider = root->provider;
+		if (!qdx_binding_hold(provider))
+			return -ESHUTDOWN;
+	} else {
+		provider = qdx_binding_lookup(&key);
+		if (IS_ERR_OR_NULL(provider))
+			return provider ? PTR_ERR(provider) : -EOPNOTSUPP;
+	}
+	if (htb && htb->command == TC_HTB_CREATE) {
+		if (root) {
+			error = -EEXIST;
+			goto out;
+		}
+		created = kzalloc(sizeof(*created), GFP_KERNEL);
+		if (!created) {
+			error = -ENOMEM;
+			goto out;
+		}
+		created->identity = htb->owner.sch;
+		created->provider = provider;
+	}
+	ops = qdx_binding_ops(provider);
+	error = ops->setup_tc(provider, port->binding, type, data);
+	if (created && !error) {
+		spin_lock_bh(&priv->tc->lock);
+		list_add_tail(&created->list, &port->roots);
+		spin_unlock_bh(&priv->tc->lock);
+		return 0; /* This actual successful root retains the provider reference. */
+	}
+	kfree(created);
+	if (root && htb->command == TC_HTB_DESTROY) {
+		/* Even a failed hardware destroy cannot retain a dead native root. */
+		spin_lock_bh(&priv->tc->lock);
+		list_del(&root->list);
+		spin_unlock_bh(&priv->tc->lock);
+		synchronize_net();
+		qdx_binding_put(root->provider);
+		kfree(root);
+	}
+out:
+	qdx_binding_put(provider);
+	return error;
+}
+
+static u16 ppe_tc_select_queue(struct dsa_switch *ds, int number,
+			      struct sk_buff *skb, struct net_device *sb_dev)
+{
+	struct qca_ppe_priv *priv = ds->priv;
+	struct ppe_tc_port *port = &priv->tc->ports[number];
+	struct qdx_binding *provider = NULL;
+	const struct qdx_tc_ops *ops;
+	struct ppe_tc_root *entry;
+	struct Qdisc *root;
+	u16 queue;
+	bool selected = false;
+
+	rcu_read_lock_bh();
+	root = rcu_dereference_bh(port->dev->qdisc);
+	spin_lock_bh(&priv->tc->lock);
+	list_for_each_entry(entry, &port->roots, list)
+		if (entry->identity == root && qdx_binding_hold(entry->provider)) {
+			provider = entry->provider;
+			break;
+		}
+	spin_unlock_bh(&priv->tc->lock);
+	if (provider) {
+		ops = qdx_binding_ops(provider);
+		selected = ops->select_queue(provider, port->dev, skb, &queue);
+		qdx_binding_put(provider);
+	}
+	rcu_read_unlock_bh();
+	if (selected && queue >= PPE_TC_NORMAL_QUEUES &&
+	    queue < READ_ONCE(port->dev->real_num_tx_queues))
+		return queue;
+	queue = netdev_pick_tx(port->dev, skb, sb_dev);
+	return queue % PPE_TC_NORMAL_QUEUES;
+}
+
+static int ppe_tc_oob_tag(struct dsa_switch *ds, int number,
+			const struct sk_buff *skb, struct dsa_oob_tag_info *tag)
+{
+	struct qca_ppe_priv *priv = ds->priv;
+	struct ppe_tc_port *port = &priv->tc->ports[number];
+	struct ppe_tc_execution *execution;
+	struct qdx_tc_queue *slot;
+	u16 queue = skb_get_queue_mapping(skb);
+	int error = 0;
+
+	if (queue >= PPE_TC_QUEUES)
+		return -ERANGE;
+	spin_lock_bh(&priv->tc->lock);
+	slot = port->slots[queue];
+	execution = slot ? slot->active_execution : NULL;
+	if (execution) {
+		tag->token = execution->class.token;
+		tag->disposition = execution->disposition == QDX_REQUIRED ?
+			DSA_OOB_TX_REQUIRED : DSA_OOB_TX_OPTIONAL;
+	} else if (queue >= PPE_TC_NORMAL_QUEUES || port->closing) {
+		error = -ESTALE;
+	}
+	spin_unlock_bh(&priv->tc->lock);
+	return error;
+}
+
+static void ppe_qdx_resolve_tx(void *context, unsigned int number, u16 queue,
+			       u64 token, enum qdx_disposition disposition,
+			       struct qdx_tx_selection *selection)
+{
+	struct qca_ppe_priv *priv = context;
+	struct ppe_tc_execution *execution;
+	struct qdx_tc_queue *slot;
+	struct ppe_tc_port *port;
+
+	*selection = (struct qdx_tx_selection) { .status = QDX_TX_REFUSED };
+	if (!priv->tc || number >= priv->data->num_ports || queue >= PPE_TC_QUEUES)
+		return;
+	port = &priv->tc->ports[number];
+	spin_lock_bh(&priv->tc->lock);
+	slot = port->slots[queue];
+	if (!token) {
+		if (disposition != QDX_NATIVE || queue >= PPE_TC_NORMAL_QUEUES ||
+		    (slot && slot->active_execution))
+			goto out;
+		selection->status = ppe_qdx_port_tx_held(priv, number) ?
+			QDX_TX_HELD : QDX_TX_NATIVE;
+		goto out;
+	}
+	if (!slot)
+		goto out;
+	list_for_each_entry(execution, &slot->executions, list) {
+		if (execution->class.token != token)
+			continue;
+		if (execution->disposition != disposition)
+			break;
+		selection->class = execution->class;
+		selection->disposition = disposition;
+		if (execution->retired) {
+			selection->status = QDX_TX_RETIRED;
+			if (disposition == QDX_OPTIONAL && slot->active_execution == execution &&
+			    !port->closing) {
+				if (execution->native_return && !ppe_qdx_port_tx_held(priv, number))
+					selection->status = QDX_TX_NATIVE;
+				else if (execution->handback_pending)
+					selection->status = QDX_TX_HELD;
+			}
+			break;
+		}
+		if (!try_module_get(THIS_MODULE))
+			break;
+		if (!ppe_tc_execution_get(execution)) {
+			module_put(THIS_MODULE);
+			break;
+		}
+		selection->owner = (struct qdx_owner) {
+			.module = THIS_MODULE, .object = execution,
+			.get = ppe_tc_execution_get, .put = ppe_tc_execution_put,
+		};
+		selection->path = execution->path;
+		selection->status = execution->held || ppe_qdx_port_tx_held(priv, number) ?
+			QDX_TX_HELD : QDX_TX_READY;
+		break;
+	}
+out:
+	spin_unlock_bh(&priv->tc->lock);
+}
+
+static int ppe_tc_netdev_event(struct notifier_block *notifier,
+			       unsigned long event, void *data)
+{
+	struct qca_ppe_tc *tc = container_of(notifier, struct qca_ppe_tc, netdev);
+	struct qca_ppe_priv *priv = tc->ports[0].priv;
+	struct net_device *dev = netdev_notifier_info_to_dev(data);
+	struct qdx_binding_scan scan;
+	struct qdx_binding_use *use;
+	struct ppe_tc_port *port;
+	struct qdx_binding *binding;
+	struct dsa_port *dp;
+	struct ppe_tc_root *root, *next;
+	LIST_HEAD(roots);
+	unsigned int number;
+
+	if (READ_ONCE(tc->native_gone) || !priv->ds.dst ||
+	    (event != NETDEV_REGISTER && event != NETDEV_UNREGISTER))
+		return NOTIFY_DONE;
+	for (number = 0; number < priv->data->num_ports; number++) {
+		dp = dsa_to_port(&priv->ds, number);
+		if (dsa_is_user_port(&priv->ds, number) && dp->user == dev)
+			break;
+	}
+	if (number == priv->data->num_ports)
+		return NOTIFY_DONE;
+	port = &tc->ports[number];
+	if (event == NETDEV_REGISTER) {
+		const struct qdx_binding_key key = {
+			.dev = dev, .role = QDX_BINDING_TC_PORT,
+		};
+		const struct qdx_owner owner = {
+			.module = THIS_MODULE, .object = port,
+			.get = ppe_tc_port_get, .put = ppe_tc_port_put,
+		};
+
+		if (port->binding)
+			return NOTIFY_DONE;
+		port->dev = dev;
+		WRITE_ONCE(port->closing, false);
+		binding = qdx_binding_publish(&key, &owner, &ppe_tc_port_ops);
+		if (IS_ERR(binding)) {
+			/* No reachable QDX keeps ordinary native networking unchanged. */
+			if (PTR_ERR(binding) == -EOPNOTSUPP)
+				return NOTIFY_DONE;
+			return notifier_from_errno(PTR_ERR(binding));
+		}
+		port->binding = binding;
+		qdx_binding_available(binding);
+		return NOTIFY_OK;
+	}
+	spin_lock_bh(&tc->lock);
+	port->closing = true;
+	list_splice_init(&port->roots, &roots);
+	spin_unlock_bh(&tc->lock);
+	synchronize_net();
+	list_for_each_entry_safe(root, next, &roots, list) {
+		list_del(&root->list);
+		qdx_binding_put(root->provider);
+		kfree(root);
+	}
+	binding = port->binding;
+	if (!binding)
+		return NOTIFY_DONE;
+	/* Native dev_shutdown already destroyed qdiscs and their real blocks.
+	 * Do not wait here for a retiring consumer's work which needs RTNL.
+	 * Its retained key keeps this exact netdevice until native todo drain.
+	 */
+	qdx_binding_invalidate(binding);
+	qdx_binding_scan_start(binding, &scan);
+	while ((use = qdx_binding_user_get(binding, &scan))) {
+		if (use->invalidate)
+			use->invalidate(use->consumer.object, true);
+		qdx_binding_user_put(use);
+	}
+	port->binding = NULL;
+	qdx_binding_withdraw(binding);
+	return NOTIFY_OK;
+}
+
+static int ppe_tc_init(struct qca_ppe_priv *priv)
+{
+	struct qca_ppe_tc *tc;
+	unsigned int number;
+	int error;
+
+	tc = devm_kzalloc(priv->ds.dev, sizeof(*tc), GFP_KERNEL);
+	if (!tc)
+		return -ENOMEM;
+	priv->tc = tc;
+	spin_lock_init(&tc->lock);
+	for (number = 0; number < priv->data->num_ports; number++) {
+		struct ppe_tc_port *port = &tc->ports[number];
+
+		port->priv = priv;
+		port->number = number;
+		refcount_set(&port->refs, 1);
+		init_waitqueue_head(&port->drained);
+		INIT_LIST_HEAD(&port->blocks);
+		INIT_LIST_HEAD(&port->roots);
+	}
+	tc->ops = qca_ppe_ops;
+	tc->ops.port_setup_tc = ppe_tc_setup;
+	tc->ops.port_setup_tc_block = ppe_tc_setup_block;
+	tc->ops.port_select_queue = ppe_tc_select_queue;
+	tc->ops.port_oob_tx_tag = ppe_tc_oob_tag;
+	priv->ds.ops = &tc->ops;
+	priv->ds.num_tx_queues = PPE_TC_QUEUES;
+	priv->ds.initial_real_num_tx_queues = PPE_TC_NORMAL_QUEUES;
+	tc->netdev.notifier_call = ppe_tc_netdev_event;
+	error = register_netdevice_notifier(&tc->netdev);
+	if (error)
+		return error;
+	tc->notifier_registered = true;
+	return 0;
+}
+
+static void ppe_tc_exit(struct qca_ppe_priv *priv)
+{
+	struct qca_ppe_tc *tc = priv->tc;
+	unsigned int number;
+
+	if (!tc)
+		return;
+	WRITE_ONCE(tc->native_gone, true);
+	if (tc->notifier_registered) {
+		unregister_netdevice_notifier(&tc->netdev);
+		tc->notifier_registered = false;
+	}
+	/* Called after native DSA destruction, with no RTNL or peer cfg held. */
+	for (number = 0; number < priv->data->num_ports; number++) {
+		struct ppe_tc_port *port = &tc->ports[number];
+
+		wait_event(port->drained, refcount_read(&port->refs) == 1);
+		spin_lock_bh(&tc->lock);
+		spin_unlock_bh(&tc->lock);
+		WARN_ON_ONCE(!list_empty(&port->blocks));
+		WARN_ON_ONCE(!list_empty(&port->roots));
+	}
+}
+
 static void ppe_qdx_lock(void *context, unsigned int port)
 {
 	struct qca_ppe_priv *priv = context;
@@ -2012,9 +3075,12 @@ static int ppe_qdx_reapply(void *context, unsigned int port)
 	ret = ppe_port_vsi_set(priv, port, pc->vsi);
 	if (ret)
 		return ret;
-	ppe_port_cnt_enable(priv, port);
-	ppe_port_bridge_txmac_set(priv, port, pc->admin && pc->link);
-	return 0;
+	ret = ppe_port_cnt_enable(priv, port);
+	if (ret)
+		return ret;
+	ret = ppe_qdx_resources_reapply(priv, port);
+	ppe_port_bridge_txmac_set(priv, port, !ret && pc->admin && pc->link);
+	return ret;
 }
 
 static int ppe_qdx_restore(void *context)
@@ -2023,6 +3089,10 @@ static int ppe_qdx_restore(void *context)
 	struct dsa_port *dp;
 	int i, ret;
 
+	ret = ppe_qdx_resources_restore(priv);
+	if (ret)
+		return ret;
+	mutex_lock(&priv->resource_lock);
 	/* CPU queue 0 and its current native scheduler, without FDB/VLAN setup. */
 	regmap_write(priv->regmap, PPE_QM_UCAST_MAP(QM_VP_PORT_OFFSET), 0);
 	for (i = 0; i < 16; i++) {
@@ -2042,6 +3112,7 @@ static int ppe_qdx_restore(void *context)
 	regmap_write(priv->regmap, PPE_TM_L1_C_SP(0), 0);
 	regmap_write(priv->regmap, PPE_TM_L1_E_SP(0), 0);
 	regmap_write(priv->regmap, PPE_TM_L1_PORT_MAP(0), 0);
+	mutex_unlock(&priv->resource_lock);
 	ppe_port_bridge_txmac_set(priv, QCA_PPE_CPU_PORT, true);
 
 	dsa_switch_for_each_user_port(dp, &priv->ds) {
@@ -2068,12 +3139,102 @@ static int ppe_qdx_restore(void *context)
 	return 0;
 }
 
+/* Shared by acquisition rollback and final release. The caller owns RTNL
+ * and resource_lock; a failed clear never makes the index available again.
+ */
+static int ppe_qdx_vsi_clear(struct qca_ppe_priv *priv, u32 vsi)
+{
+	const u32 zero[2] = {};
+	u32 row[2];
+	int error;
+
+	ASSERT_RTNL();
+	lockdep_assert_held(&priv->resource_lock);
+	error = regmap_bulk_write(priv->regmap, PPE_VSI_TBL(vsi), zero, ARRAY_SIZE(zero));
+	if (!error)
+		error = regmap_bulk_read(priv->regmap, PPE_VSI_TBL(vsi), row, ARRAY_SIZE(row));
+	if (!error && (row[0] || row[1]))
+		error = -EIO;
+	if (!error)
+		clear_bit(vsi, priv->vsi_bitmap);
+	return error;
+}
+
+static int ppe_qdx_vsi_alloc(void *context, unsigned int port, u32 *wire_vsi)
+{
+	struct qca_ppe_priv *priv = context;
+	u32 row[2], actual[2];
+	unsigned int vsi;
+	int error, undo;
+
+	ASSERT_RTNL();
+	if (port >= priv->data->num_ports || !dsa_is_user_port(&priv->ds, port))
+		return -EINVAL;
+	mutex_lock(&priv->resource_lock);
+	if (priv->resources_terminal) {
+		error = -ESHUTDOWN;
+		goto out;
+	}
+	/* All native bridge/VLAN bitmap users are serialized by RTNL too. */
+	vsi = find_next_zero_bit(priv->vsi_bitmap, PPE_VSI_MAX, 1);
+	if (vsi == PPE_VSI_MAX) {
+		error = -ENOSPC;
+		goto out;
+	}
+	set_bit(vsi, priv->vsi_bitmap);
+	row[0] = FIELD_PREP(PPE_VSI_TBL_MEMBER, BIT(QCA_PPE_CPU_PORT) | BIT(port)) |
+		 FIELD_PREP(PPE_VSI_TBL_UUC, BIT(QCA_PPE_CPU_PORT)) |
+		 FIELD_PREP(PPE_VSI_TBL_UMC, BIT(QCA_PPE_CPU_PORT)) |
+		 FIELD_PREP(PPE_VSI_TBL_BC, BIT(QCA_PPE_CPU_PORT));
+	row[1] = PPE_VSI_TBL_NEW_ADDR_LRN_EN | PPE_VSI_TBL_STA_MOVE_LRN_EN;
+	error = regmap_bulk_write(priv->regmap, PPE_VSI_TBL(vsi), row, ARRAY_SIZE(row));
+	if (!error)
+		error = regmap_bulk_read(priv->regmap, PPE_VSI_TBL(vsi), actual, ARRAY_SIZE(actual));
+	if (!error && memcmp(row, actual, sizeof(row)))
+		error = -EIO;
+	if (error) {
+		undo = ppe_qdx_vsi_clear(priv, vsi);
+		if (undo)
+			dev_err(priv->ds.dev, "VSI %u allocation rollback failed: %d; reserved\n",
+				vsi, undo);
+		goto out;
+	}
+	*wire_vsi = vsi;
+out:
+	mutex_unlock(&priv->resource_lock);
+	return error;
+}
+
+static int ppe_qdx_vsi_release(void *context, u32 vsi)
+{
+	struct qca_ppe_priv *priv = context;
+	int error;
+
+	ASSERT_RTNL();
+	mutex_lock(&priv->resource_lock);
+	if (!vsi || vsi >= PPE_VSI_MAX || !test_bit(vsi, priv->vsi_bitmap))
+		error = -EUCLEAN;
+	else
+		error = ppe_qdx_vsi_clear(priv, vsi);
+	mutex_unlock(&priv->resource_lock);
+	return error;
+}
+
 static const struct qdx_ppe_ops ppe_qdx_ops = {
 	.lock = ppe_qdx_lock,
 	.unlock = ppe_qdx_unlock,
 	.snapshot = ppe_qdx_snapshot,
 	.reapply = ppe_qdx_reapply,
 	.restore = ppe_qdx_restore,
+	.rx_acquire = ppe_qdx_rx_acquire,
+	.rx_hold = ppe_qdx_rx_hold,
+	.rx_release = ppe_qdx_rx_release,
+	.tx_prepare = ppe_qdx_tx_prepare,
+	.tx_hold = ppe_qdx_tx_hold,
+	.tx_release = ppe_qdx_tx_release,
+	.resolve_tx = ppe_qdx_resolve_tx,
+	.vsi_alloc = ppe_qdx_vsi_alloc,
+	.vsi_release = ppe_qdx_vsi_release,
 };
 
 static const struct regmap_config ppe_regmap_cfg = {
@@ -2106,6 +3267,7 @@ static int qca_ppe_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	priv->data = data;
+	ppe_qdx_resources_init(priv);
 	for (i = 0; i < QCA_PPE_MAX_PORTS; i++) {
 		mutex_init(&priv->port_config[i].lock);
 		priv->port_config[i].mtu = ETH_DATA_LEN;
@@ -2197,9 +3359,14 @@ static int qca_ppe_probe(struct platform_device *pdev)
 			goto err_clk;
 	}
 
+	if (data->type == PPE_TYPE_IPQ8074) {
+		ret = ppe_tc_init(priv);
+		if (ret)
+			goto err_tc;
+	}
 	ret = dsa_register_switch(ds);
 	if (ret)
-		goto err_clk;
+		goto err_tc;
 
 	platform_set_drvdata(pdev, priv);
 	if (data->type == PPE_TYPE_IPQ8074) {
@@ -2214,16 +3381,22 @@ static int qca_ppe_probe(struct platform_device *pdev)
 			info.ports |= BIT(dp->index);
 			info.conduit = dsa_port_to_conduit(dp);
 		}
+		/* Lifecycle preparation takes RTNL before using this backpointer. */
+		rtnl_lock();
 		priv->qdx = qdx_ppe_attach(&info);
 		if (IS_ERR(priv->qdx)) {
 			ret = PTR_ERR(priv->qdx);
 			priv->qdx = NULL;
+			rtnl_unlock();
 			dsa_unregister_switch(ds);
-			goto err_clk;
+			goto err_tc;
 		}
+		rtnl_unlock();
 	}
 	return 0;
 
+err_tc:
+	ppe_tc_exit(priv);
 err_clk:
 	clk_bulk_disable_unprepare(priv->num_clks, priv->clks);
 	return ret;
@@ -2236,6 +3409,7 @@ static void qca_ppe_remove(struct platform_device *pdev)
 	qdx_ppe_detach(priv->qdx);
 	priv->qdx = NULL;
 	dsa_unregister_switch(&priv->ds);
+	ppe_tc_exit(priv);
 	clk_bulk_disable_unprepare(priv->num_clks, priv->clks);
 }
 

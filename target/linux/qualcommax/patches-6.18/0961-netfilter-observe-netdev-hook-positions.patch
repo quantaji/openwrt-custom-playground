@@ -1,0 +1,194 @@
+Subject: [PATCH] netfilter: expose current device hook positions and changes
+
+Expose a sleepable native query for live NETDEV ingress and egress entries,
+including the unique native flowtable position at ingress. Notify actual
+successful control mutations after the hook mutex is released, including
+removal when optional array compaction fails. The notification does not veto
+native operations and introduces no packet-path processing.
+
+Signed-off-by: Codex
+
+--- a/include/linux/netfilter.h
++++ b/include/linux/netfilter.h
+@@ -203,6 +203,30 @@
+ void nf_unregister_net_hooks(struct net *net, const struct nf_hook_ops *reg,
+ 			     unsigned int n);
+ 
++struct nf_flowtable;
++struct notifier_block;
++
++#define NF_NETDEV_ANCHOR_ABSENT		(-1)
++#define NF_NETDEV_ANCHOR_AMBIGUOUS	(-2)
++
++struct nf_netdev_hook_position {
++	unsigned int live_count;
++	int anchor_index;
++};
++
++/* Device identity is borrowed through the sleepable notification call. */
++struct nf_netdev_hook_change {
++	struct net_device *dev;
++	unsigned int hooknum;
++};
++
++/* Caller holds dev; a non-NULL ingress anchor needs a live FT binding. */
++int nf_netdev_hook_position(struct net_device *dev, unsigned int hooknum,
++			    const struct nf_flowtable *anchor,
++			    struct nf_netdev_hook_position *result);
++int nf_netdev_register_notifier(struct notifier_block *nb);
++int nf_netdev_unregister_notifier(struct notifier_block *nb);
++
+ /* Functions to register get/setsockopt ranges (non-inclusive).  You
+    need to check permissions yourself! */
+ int nf_register_sockopt(struct nf_sockopt_ops *reg);
+--- a/net/netfilter/core.c
++++ b/net/netfilter/core.c
+@@ -22,6 +22,7 @@
+ #include <linux/mutex.h>
+ #include <linux/mm.h>
+ #include <linux/rcupdate.h>
++#include <linux/notifier.h>
+ #include <net/net_namespace.h>
+ #include <net/netfilter/nf_queue.h>
+ #include <net/sock.h>
+@@ -37,6 +38,7 @@
+ #endif
+ 
+ static DEFINE_MUTEX(nf_hook_mutex);
++SRCU_NOTIFIER_HEAD_STATIC(nf_netdev_chain);
+ 
+ /* max hooks per family/hooknum */
+ #define MAX_HOOK_COUNT		1024
+@@ -96,6 +98,62 @@
+ 	.hook = accept_all,
+ 	.priority = INT_MIN,
+ };
++
++int nf_netdev_hook_position(struct net_device *dev, unsigned int hooknum,
++			    const struct nf_flowtable *anchor,
++			    struct nf_netdev_hook_position *result)
++{
++	const struct nf_hook_entries *head = NULL;
++	struct nf_hook_ops **ops;
++	unsigned int i;
++
++	if (!dev || !result ||
++	    (hooknum != NF_NETDEV_INGRESS && hooknum != NF_NETDEV_EGRESS) ||
++	    (anchor && hooknum != NF_NETDEV_INGRESS))
++		return -EINVAL;
++
++	result->live_count = 0;
++	result->anchor_index = NF_NETDEV_ANCHOR_ABSENT;
++	mutex_lock(&nf_hook_mutex);
++#ifdef CONFIG_NETFILTER_INGRESS
++	if (hooknum == NF_NETDEV_INGRESS)
++		head = nf_entry_dereference(dev->nf_hooks_ingress);
++#endif
++#ifdef CONFIG_NETFILTER_EGRESS
++	if (hooknum == NF_NETDEV_EGRESS)
++		head = nf_entry_dereference(dev->nf_hooks_egress);
++#endif
++	if (head) {
++		ops = nf_hook_entries_get_hook_ops(head);
++		for (i = 0; i < head->num_hook_entries; i++) {
++			if (ops[i] == &dummy_ops)
++				continue;
++			if (anchor && ops[i]->hook_ops_type == NF_HOOK_OP_NFT_FT &&
++			    ops[i]->priv == anchor) {
++				if (result->anchor_index == NF_NETDEV_ANCHOR_ABSENT)
++					result->anchor_index = result->live_count;
++				else
++					result->anchor_index = NF_NETDEV_ANCHOR_AMBIGUOUS;
++			}
++			result->live_count++;
++		}
++	}
++	mutex_unlock(&nf_hook_mutex);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(nf_netdev_hook_position);
++
++int nf_netdev_register_notifier(struct notifier_block *nb)
++{
++	return srcu_notifier_chain_register(&nf_netdev_chain, nb);
++}
++EXPORT_SYMBOL_GPL(nf_netdev_register_notifier);
++
++int nf_netdev_unregister_notifier(struct notifier_block *nb)
++{
++	return srcu_notifier_chain_unregister(&nf_netdev_chain, nb);
++}
++EXPORT_SYMBOL_GPL(nf_netdev_unregister_notifier);
+ 
+ static struct nf_hook_entries *
+ nf_hook_entries_grow(const struct nf_hook_entries *old,
+@@ -360,6 +418,25 @@
+ 	return pf == NFPROTO_NETDEV && reg->hooknum == NF_NETDEV_EGRESS;
+ }
+ 
++static void nf_netdev_hook_changed(const struct nf_hook_ops *reg, int pf)
++{
++	struct nf_netdev_hook_change change;
++
++	if (!rcu_access_pointer(nf_netdev_chain.head))
++		return;
++	if (nf_ingress_hook(reg, pf))
++		change.hooknum = NF_NETDEV_INGRESS;
++	else if (nf_egress_hook(reg, pf))
++		change.hooknum = NF_NETDEV_EGRESS;
++	else
++		return;
++
++	change.dev = reg->dev;
++	dev_hold(change.dev);
++	srcu_notifier_call_chain(&nf_netdev_chain, 0, &change);
++	dev_put(change.dev);
++}
++
+ static void nf_static_key_inc(const struct nf_hook_ops *reg, int pf)
+ {
+ #ifdef CONFIG_JUMP_LABEL
+@@ -452,6 +529,7 @@
+ 
+ 	BUG_ON(p == new_hooks);
+ 	nf_hook_entries_free(p);
++	nf_netdev_hook_changed(reg, pf);
+ 	return 0;
+ }
+ 
+@@ -487,6 +565,7 @@
+ {
+ 	struct nf_hook_entries __rcu **pp;
+ 	struct nf_hook_entries *p;
++	bool changed;
+ 
+ 	pp = nf_hook_entry_head(net, pf, reg->hooknum, reg->dev);
+ 	if (!pp)
+@@ -500,7 +579,8 @@
+ 		return;
+ 	}
+ 
+-	if (nf_remove_net_hook(p, reg)) {
++	changed = nf_remove_net_hook(p, reg);
++	if (changed) {
+ #ifdef CONFIG_NETFILTER_INGRESS
+ 		if (nf_ingress_hook(reg, pf))
+ 			net_dec_ingress_queue();
+@@ -516,11 +596,12 @@
+ 
+ 	p = __nf_hook_entries_try_shrink(p, pp);
+ 	mutex_unlock(&nf_hook_mutex);
+-	if (!p)
+-		return;
+-
+-	nf_queue_nf_hook_drop(net);
+-	nf_hook_entries_free(p);
++	if (p) {
++		nf_queue_nf_hook_drop(net);
++		nf_hook_entries_free(p);
++	}
++	if (changed)
++		nf_netdev_hook_changed(reg, pf);
+ }
+ 
+ void nf_unregister_net_hook(struct net *net, const struct nf_hook_ops *reg)

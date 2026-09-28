@@ -13,6 +13,48 @@ static DEFINE_MUTEX(detachment_lock);
 static struct qdx *ethernet_instance;
 static struct qdx_edma *native_edma;
 static struct qdx_ppe *native_ppe;
+/* qdx-drv remains resident; native PPE detach must not recycle old OOB tokens. */
+static u64 last_tx_token;
+
+struct qdx *qdx_ethernet_instance_get(struct net_device *dev)
+{
+	struct qdx *qdx = NULL;
+	unsigned int i;
+
+	mutex_lock(&attachment_lock);
+	if (!ethernet_instance)
+		goto out;
+	if (!dev || (native_edma && native_edma->info.conduit == dev)) {
+		qdx = ethernet_instance;
+	} else {
+		for (i = 1; i < QDX_PHYSICAL_PORTS; i++) {
+			if (ethernet_instance->ethernet->ports[i].netdev == dev &&
+			    ethernet_instance->ethernet->ports[i].registered) {
+				qdx = ethernet_instance;
+				break;
+			}
+		}
+	}
+	if (qdx) {
+		get_device(qdx->dev);
+		atomic_inc(&qdx->service_users);
+	}
+out:
+	mutex_unlock(&attachment_lock);
+	return qdx;
+}
+
+void qdx_ethernet_instance_put(struct qdx *qdx)
+{
+	struct device *dev = qdx->dev;
+	unsigned long flags;
+
+	spin_lock_irqsave(&qdx->io_admission, flags);
+	if (atomic_dec_and_test(&qdx->service_users))
+		wake_up_all(&qdx->services_drained);
+	spin_unlock_irqrestore(&qdx->io_admission, flags);
+	put_device(dev);
+}
 
 static int qdx_port_command(struct qdx_port *port, u32 opcode,
 			    const void *body, size_t size)
@@ -78,15 +120,6 @@ static int qdx_port_apply(struct qdx_port *port,
 	ret = eth->ppe->info.ops->reapply(eth->ppe->info.context, port->ifnum);
 	if (ret)
 		goto rollback;
-	/* Firmware physical updates may also write the shared RX selector. */
-	if (eth->transport == QDX_ETH_NATIVE || eth->transport == QDX_ETH_FIRMWARE) {
-		ret = eth->edma->info.ops->select(eth->edma->info.context,
-						eth->transport);
-		if (ret) {
-			qdx_fail(port->qdx, ret);
-			return ret;
-		}
-	}
 	port->confirmed = *state;
 	port->configured = true;
 	port->link_state = state->admin ? state->link_state : 0;
@@ -120,10 +153,8 @@ rollback:
 	}
 	if (mac_done && !undo)
 		undo = qdx_port_command(port, QDX_IF_MAC, old.mac, ETH_ALEN);
-	if (!undo && (eth->transport == QDX_ETH_NATIVE ||
-		      eth->transport == QDX_ETH_FIRMWARE))
-		undo = eth->edma->info.ops->select(eth->edma->info.context,
-						 eth->transport);
+	if (!undo)
+		undo = eth->ppe->info.ops->reapply(eth->ppe->info.context, port->ifnum);
 	if (undo) {
 		qdx_fail(port->qdx, undo);
 		return ret;
@@ -186,7 +217,7 @@ static void qdx_mac_work(struct work_struct *work)
 		mutex_unlock(&port->lock);
 		eth->ppe->info.ops->unlock(eth->ppe->info.context, i);
 	}
-	qdx_ethernet_wake(eth->edma->qdx);
+	qdx_ethernet_progress(eth->edma->qdx);
 out:
 	rtnl_unlock();
 }
@@ -218,7 +249,6 @@ int qdx_ethernet_register(struct qdx *qdx)
 	if (!eth)
 		return -ENOMEM;
 	qdx->ethernet = eth;
-	eth->transport = QDX_ETH_NATIVE;
 	qdx_interfaces_init(qdx);
 	INIT_WORK(&eth->mac_work, qdx_mac_work);
 	eth->netdev_notifier.notifier_call = qdx_netdev_event;
@@ -272,8 +302,8 @@ struct qdx_edma *qdx_edma_attach(const struct qdx_edma_info *info)
 
 	if (!info->dev || !info->conduit || !info->ops || !info->ops->quiesce ||
 	    !info->ops->restore || !info->ops->receive || !info->ops->activate ||
-	    !info->ops->resume_shared || !info->ops->select ||
-	    !info->ops->complete_tx || !info->ops->wake)
+	    !info->ops->resume_shared || !info->ops->map_rx_queue ||
+	    !info->ops->complete_tx || !info->ops->resource_progress || !info->ops->tx_gate)
 		return ERR_PTR(-EINVAL);
 	edma = kzalloc(sizeof(*edma), GFP_KERNEL);
 	if (!edma)
@@ -301,7 +331,10 @@ struct qdx_ppe *qdx_ppe_attach(const struct qdx_ppe_info *info)
 
 	if (!info->dev || !info->conduit || !info->ops || !info->ops->snapshot ||
 	    !info->ops->reapply || !info->ops->restore || !info->ops->lock ||
-	    !info->ops->unlock || !info->ports || info->ports & ~GENMASK(6, 1))
+	    !info->ops->unlock || !info->ops->rx_acquire || !info->ops->rx_hold ||
+	    !info->ops->rx_release || !info->ops->tx_prepare || !info->ops->tx_hold ||
+	    !info->ops->tx_release || !info->ops->resolve_tx || !info->ops->vsi_alloc ||
+	    !info->ops->vsi_release || !info->ports || info->ports & ~GENMASK(6, 1))
 		return ERR_PTR(-EINVAL);
 	ppe = kzalloc(sizeof(*ppe), GFP_KERNEL);
 	if (!ppe)
@@ -322,6 +355,20 @@ struct qdx_ppe *qdx_ppe_attach(const struct qdx_ppe_info *info)
 	return ppe;
 }
 EXPORT_SYMBOL_GPL(qdx_ppe_attach);
+
+u64 qdx_ppe_next_tx_token(struct qdx_ppe *ppe)
+{
+	u64 token = 0;
+
+	mutex_lock(&attachment_lock);
+	if (ppe && native_ppe == ppe && !ppe->detaching && ppe->qdx &&
+	    READ_ONCE(ppe->qdx->state) == QDX_READY &&
+	    !atomic_read(&ppe->qdx->failure) && last_tx_token != U64_MAX)
+		token = ++last_tx_token;
+	mutex_unlock(&attachment_lock);
+	return token;
+}
+EXPORT_SYMBOL_GPL(qdx_ppe_next_tx_token);
 
 /* Called without native locks, before the native driver's first destruction. */
 static void qdx_native_drain(struct qdx *qdx)
@@ -351,6 +398,7 @@ void qdx_edma_detach(struct qdx_edma *edma)
 		edma->qdx->ethernet->edma = NULL;
 	native_edma = NULL;
 	mutex_unlock(&attachment_lock);
+	synchronize_net();
 	dev_put(edma->info.conduit);
 	put_device(edma->info.dev);
 	kfree(edma);
@@ -372,6 +420,7 @@ void qdx_ppe_detach(struct qdx_ppe *ppe)
 		ppe->qdx->ethernet->ppe = NULL;
 	native_ppe = NULL;
 	mutex_unlock(&attachment_lock);
+	synchronize_net();
 	dev_put(ppe->info.conduit);
 	put_device(ppe->info.dev);
 	kfree(ppe);
@@ -426,7 +475,6 @@ int qdx_ethernet_prepare(struct qdx *qdx)
 	ret = qdx_interfaces_register(qdx);
 	if (ret)
 		goto out;
-	WRITE_ONCE(eth->transport, QDX_ETH_TRANSITION);
 	eth->native_touched = true;
 	ret = eth->edma->info.ops->quiesce(eth->edma->info.context,
 					    qdx->limits.native_rx_entries);
@@ -470,14 +518,14 @@ int qdx_ethernet_start(struct qdx *qdx)
 	}
 	if (!ret)
 		ret = eth->edma->info.ops->resume_shared(eth->edma->info.context);
+	/* Both receive rings are live. Unclaimed traffic belongs to native
+	 * queue 0; peers acquire separate queues after READY is published.
+	 */
 	if (!ret)
-		ret = eth->edma->info.ops->select(eth->edma->info.context,
-						QDX_ETH_NATIVE);
-	if (!ret) {
-		eth->users = 0;
-		WRITE_ONCE(eth->transport, QDX_ETH_NATIVE);
-		qdx_ethernet_wake(qdx);
-	}
+		ret = eth->edma->info.ops->map_rx_queue(eth->edma->info.context,
+						    0, false);
+	if (!ret)
+		qdx_ethernet_progress(qdx);
 	qdx_ethernet_unlock(qdx);
 	return ret;
 }
@@ -488,8 +536,6 @@ void qdx_ethernet_stop(struct qdx *qdx)
 	unsigned int i;
 
 	cancel_work_sync(&eth->mac_work);
-	if (eth->native_touched)
-		WRITE_ONCE(eth->transport, QDX_ETH_UNAVAILABLE);
 	for (i = 1; i < QDX_PHYSICAL_PORTS; i++)
 		qdx_port_withdraw(&eth->ports[i]);
 	if (eth->edma && eth->native_touched)
@@ -539,137 +585,10 @@ int qdx_ethernet_activate(struct qdx *qdx)
 		rtnl_unlock();
 		return ret;
 	}
-	WRITE_ONCE(eth->transport, QDX_ETH_NATIVE);
 	eth->native_touched = false;
-	if (!eth->edma->detaching && netif_running(eth->edma->info.conduit))
-		netif_wake_queue(eth->edma->info.conduit);
+	qdx_ethernet_progress(qdx);
 	rtnl_unlock();
 	return 0;
-}
-
-enum qdx_eth_transport qdx_edma_transport(struct qdx_edma *edma)
-{
-	if (!edma || !READ_ONCE(edma->qdx))
-		return QDX_ETH_NATIVE;
-	return READ_ONCE(edma->qdx->ethernet->transport);
-}
-EXPORT_SYMBOL_GPL(qdx_edma_transport);
-
-/* RTNL serializes resource users and the shared wired transport. */
-static int qdx_ethernet_select(struct qdx *qdx, enum qdx_eth_transport target)
-{
-	struct qdx_ethernet *eth = qdx->ethernet;
-	enum qdx_eth_transport old;
-	unsigned int i;
-	int ret = 0, undo;
-
-	ASSERT_RTNL();
-	if (!eth->edma || !eth->ppe)
-		return -ENODEV;
-	qdx_ports_lock(eth);
-	if (eth->edma->detaching || eth->ppe->detaching ||
-	    READ_ONCE(qdx->state) != QDX_READY || atomic_read(&qdx->failure)) {
-		ret = -EIO;
-		goto out;
-	}
-	old = eth->transport;
-	if (old == target)
-		goto out;
-	if ((old != QDX_ETH_NATIVE && old != QDX_ETH_FIRMWARE) ||
-	    (target != QDX_ETH_NATIVE && target != QDX_ETH_FIRMWARE)) {
-		ret = -EAGAIN;
-		goto out;
-	}
-
-	/* A queued MAC notifier must not leave the first user with stale state. */
-	for (i = 1; i < QDX_PHYSICAL_PORTS; i++) {
-		struct qdx_port *port = &eth->ports[i];
-		struct qdx_port_state state;
-
-		if (!port->registered)
-			continue;
-		ret = eth->ppe->info.ops->snapshot(eth->ppe->info.context, i, &state);
-		if (!ret && !ether_addr_equal(port->confirmed.mac, state.mac))
-			ret = qdx_port_apply(port, &state);
-		if (ret) {
-			qdx_port_withdraw(port);
-			qdx_fail(qdx, ret);
-			goto out;
-		}
-	}
-	for (i = 1; i < QDX_PHYSICAL_PORTS; i++)
-		WRITE_ONCE(eth->ports[i].changing, true);
-	WRITE_ONCE(eth->transport, QDX_ETH_TRANSITION);
-	netif_tx_disable(eth->edma->info.conduit);
-	for (i = 1; i < QDX_PHYSICAL_PORTS; i++)
-		qdx_port_withdraw(&eth->ports[i]);
-
-	ret = eth->edma->info.ops->select(eth->edma->info.context, target);
-	if (ret) {
-		undo = eth->edma->info.ops->select(eth->edma->info.context, old);
-		if (undo || target == QDX_ETH_NATIVE) {
-			WRITE_ONCE(eth->transport, QDX_ETH_UNAVAILABLE);
-			qdx_fail(qdx, undo ? undo : ret);
-		} else {
-			WRITE_ONCE(eth->transport, old);
-		}
-	} else {
-		WRITE_ONCE(eth->transport, target);
-	}
-	for (i = 1; i < QDX_PHYSICAL_PORTS; i++)
-		WRITE_ONCE(eth->ports[i].changing, false);
-	if (!atomic_read(&qdx->failure)) {
-		for (i = 1; i < QDX_PHYSICAL_PORTS; i++)
-			qdx_port_publish(&eth->ports[i]);
-		qdx_ethernet_wake(qdx);
-	}
-out:
-	qdx_ports_unlock(eth);
-	return ret;
-}
-
-int qdx_ethernet_acquire(struct qdx *qdx)
-{
-	struct qdx_ethernet *eth = qdx->ethernet;
-	int ret;
-
-	ASSERT_RTNL();
-	if (READ_ONCE(qdx->state) != QDX_READY || atomic_read(&qdx->failure))
-		return -EAGAIN;
-	if (!eth->edma || !eth->ppe || eth->edma->detaching || eth->ppe->detaching)
-		return -ENODEV;
-	if (eth->users == UINT_MAX)
-		return -EOVERFLOW;
-	if (eth->users) {
-		eth->users++;
-		return 0;
-	}
-	ret = qdx_ethernet_select(qdx, QDX_ETH_FIRMWARE);
-	if (!ret)
-		eth->users = 1;
-	return ret;
-}
-
-int qdx_ethernet_release(struct qdx *qdx)
-{
-	struct qdx_ethernet *eth = qdx->ethernet;
-	int ret;
-
-	ASSERT_RTNL();
-	if (!eth->users)
-		return -EINVAL;
-	if (--eth->users)
-		return 0;
-	if (READ_ONCE(qdx->state) != QDX_READY || atomic_read(&qdx->failure))
-		return -EIO;
-	ret = qdx_ethernet_select(qdx, QDX_ETH_NATIVE);
-	if (ret) {
-		WRITE_ONCE(eth->transport, QDX_ETH_UNAVAILABLE);
-		if (eth->edma)
-			netif_tx_disable(eth->edma->info.conduit);
-		qdx_fail(qdx, ret);
-	}
-	return ret;
 }
 
 int qdx_port_prepare(struct qdx_ppe *ppe, unsigned int number)
@@ -703,7 +622,7 @@ int qdx_port_prepare(struct qdx_ppe *ppe, unsigned int number)
 		}
 		mutex_unlock(&port->lock);
 		if (!atomic_read(&ppe->qdx->failure))
-			qdx_ethernet_wake(ppe->qdx);
+			qdx_ethernet_progress(ppe->qdx);
 		return ret;
 	}
 	port->link_state = 0;
@@ -732,7 +651,7 @@ int qdx_port_finish(struct qdx_ppe *ppe, unsigned int number)
 	if (!ret)
 		qdx_port_publish(port);
 	mutex_unlock(&port->lock);
-	qdx_ethernet_wake(ppe->qdx);
+	qdx_ethernet_progress(ppe->qdx);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(qdx_port_finish);
@@ -809,119 +728,16 @@ int qdx_port_close(struct qdx_ppe *ppe, unsigned int number)
 }
 EXPORT_SYMBOL_GPL(qdx_port_close);
 
-void qdx_ethernet_wake(struct qdx *qdx)
+void qdx_ethernet_progress(struct qdx *qdx)
 {
-	struct qdx_ethernet *eth = qdx->ethernet;
-	struct net_device *dev;
-	unsigned int i;
+	struct qdx_edma *edma;
 
-	if (!eth->edma || eth->edma->detaching)
-		return;
-	for (i = 1; i < QDX_PHYSICAL_PORTS; i++)
-		if (READ_ONCE(eth->ports[i].changing))
-			return;
-	if (READ_ONCE(eth->transport) == QDX_ETH_NATIVE) {
-		eth->edma->info.ops->wake(eth->edma->info.context);
-		return;
-	}
-	if (READ_ONCE(eth->transport) != QDX_ETH_FIRMWARE ||
-	    atomic_read(&qdx->failure) || !qdx_io_has_space(qdx))
-		return;
-	dev = eth->edma->info.conduit;
-	if (!netif_running(dev))
-		return;
-	for (i = 1; i < QDX_PHYSICAL_PORTS; i++) {
-		if (READ_ONCE(eth->ports[i].available)) {
-			netif_wake_queue(dev);
-			return;
-		}
-	}
+	rcu_read_lock();
+	edma = READ_ONCE(qdx->ethernet->edma);
+	if (edma && !READ_ONCE(edma->detaching))
+		edma->info.ops->resource_progress(edma->info.context);
+	rcu_read_unlock();
 }
-
-netdev_tx_t qdx_ethernet_xmit(struct qdx_edma *edma, struct sk_buff *skb,
-			     unsigned int number)
-{
-	struct qdx_port *port;
-	struct sk_buff *packet = skb;
-	struct net_device *dev = edma->info.conduit;
-	unsigned int bytes = skb->len;
-	int ret;
-
-	if (qdx_edma_transport(edma) == QDX_ETH_TRANSITION) {
-		netif_stop_queue(dev);
-		smp_mb();
-		if (qdx_edma_transport(edma) != QDX_ETH_TRANSITION)
-			netif_wake_queue(dev);
-		return NETDEV_TX_BUSY;
-	}
-	if (qdx_edma_transport(edma) != QDX_ETH_FIRMWARE || edma->detaching)
-		goto drop;
-	port = qdx_port_get(edma->qdx, 0, number);
-	if (!port) {
-		if (number < QDX_PHYSICAL_PORTS &&
-		    READ_ONCE(edma->qdx->ethernet->ports[number].changing)) {
-			netif_stop_queue(dev);
-			smp_mb();
-			qdx_ethernet_wake(edma->qdx);
-			return NETDEV_TX_BUSY;
-		}
-		goto drop;
-	}
-	if (unlikely(skb->len < ETH_HLEN || skb_is_gso(skb) ||
-		     skb->len > edma->info.max_frame))
-		goto put_drop;
-	if (!qdx_io_has_space(edma->qdx)) {
-		netif_stop_queue(dev);
-		smp_mb();
-		if (!qdx_io_has_space(edma->qdx)) {
-			qdx_port_put(port);
-			return NETDEV_TX_BUSY;
-		}
-		netif_wake_queue(dev);
-	}
-	if (skb_is_nonlinear(skb) || skb->ip_summed == CHECKSUM_PARTIAL ||
-	    skb->len < edma->info.tx_min_size) {
-		packet = skb_copy_expand(skb, skb_headroom(skb),
-					max_t(unsigned int, skb_tailroom(skb),
-					      edma->info.tx_min_size), GFP_ATOMIC);
-		if (!packet)
-			goto put_drop;
-		if (packet->ip_summed == CHECKSUM_PARTIAL && skb_checksum_help(packet))
-			goto free_copy;
-		if (skb_put_padto(packet, edma->info.tx_min_size)) {
-			packet = NULL; /* skb_put_padto consumes allocation on failure. */
-			goto put_drop;
-		}
-	}
-	ret = qdx_io_send(port, packet, netdev_get_tx_queue(dev, 0), bytes);
-	if (!ret) {
-		if (packet != skb)
-			dev_consume_skb_any(skb);
-		qdx_port_put(port);
-		return NETDEV_TX_OK;
-	}
-	if (packet != skb)
-		dev_kfree_skb_any(packet);
-	if (ret == -ENOSPC || ret == -EAGAIN ||
-	    (ret == -ESHUTDOWN && READ_ONCE(port->changing) &&
-	     !atomic_read(&edma->qdx->failure))) {
-		netif_stop_queue(dev);
-		smp_mb();
-		qdx_ethernet_wake(edma->qdx);
-		qdx_port_put(port);
-		return NETDEV_TX_BUSY;
-	}
-	goto put_drop;
-free_copy:
-	dev_kfree_skb_any(packet);
-put_drop:
-	qdx_port_put(port);
-drop:
-	dev->stats.tx_dropped++;
-	dev_kfree_skb_any(skb);
-	return NETDEV_TX_OK;
-}
-EXPORT_SYMBOL_GPL(qdx_ethernet_xmit);
 
 void qdx_ethernet_receive(struct qdx *qdx, unsigned int core, u32 ifnum,
 			struct sk_buff *skb, struct napi_struct *napi)
@@ -938,3 +754,352 @@ void qdx_ethernet_receive(struct qdx *qdx, unsigned int core, u32 ifnum,
 	edma->info.ops->receive(edma->info.context, ifnum, skb, napi);
 	qdx_port_put(port);
 }
+
+static void qdx_vsi_free(struct work_struct *work)
+{
+	struct qdx_vsi *vsi = container_of(work, struct qdx_vsi, release_work);
+	int error;
+
+	/* Peer cfg never waits for RTNL. The retained port prevents native detach
+	 * from destroying regmap/priv before this actual resource release ends.
+	 */
+	rtnl_lock();
+	error = vsi->ppe->info.ops->vsi_release(vsi->ppe->info.context, vsi->wire);
+	rtnl_unlock();
+	if (error) {
+		dev_err(vsi->ppe->info.dev, "VSI %u release failed: %d; reservation retained\n",
+			vsi->wire, error);
+		qdx_stop_execution(vsi->physical->service, error);
+		return;
+	}
+	module_put(vsi->native_owner);
+	qdx_endpoint_put(vsi->physical);
+	qdx_port_put(vsi->port);
+	kfree(vsi);
+}
+
+struct qdx_vsi *qdx_vsi_alloc(struct qdx_endpoint *physical, u32 *wire_vsi)
+{
+	struct qdx_vsi *vsi;
+	struct qdx_port *port;
+	struct qdx_ppe *ppe;
+	struct qdx *qdx;
+	struct module *owner;
+	int error;
+
+	ASSERT_RTNL();
+	if (!physical || !physical->port || !wire_vsi)
+		return ERR_PTR(-EINVAL);
+	if (!qdx_endpoint_command_ready(physical))
+		return ERR_PTR(-ESHUTDOWN);
+	qdx = physical->service->qdx;
+	port = qdx_port_get(qdx, physical->core->id, physical->ifnum);
+	if (!port)
+		return ERR_PTR(-ENODEV);
+	ppe = READ_ONCE(qdx->ethernet->ppe);
+	if (!ppe || READ_ONCE(ppe->detaching) || atomic_read(&qdx->failure)) {
+		error = -ESHUTDOWN;
+		goto put_port;
+	}
+	vsi = kzalloc(sizeof(*vsi), GFP_KERNEL);
+	if (!vsi) {
+		error = -ENOMEM;
+		goto put_port;
+	}
+	/* Native remove waits for port references before returning. A module
+	 * reference additionally excludes starting its unload while leased.
+	 */
+	owner = ppe->info.dev->driver->owner;
+	if (!try_module_get(owner)) {
+		error = -ENODEV;
+		goto free;
+	}
+	error = ppe->info.ops->vsi_alloc(ppe->info.context, port->ifnum, &vsi->wire);
+	if (error)
+		goto put_module;
+	vsi->physical = physical;
+	qdx_endpoint_hold(physical);
+	vsi->port = port;
+	vsi->ppe = ppe;
+	vsi->native_owner = owner;
+	INIT_WORK(&vsi->release_work, qdx_vsi_free);
+	*wire_vsi = vsi->wire;
+	return vsi;
+put_module:
+	module_put(owner);
+free:
+	kfree(vsi);
+put_port:
+	qdx_port_put(port);
+	return ERR_PTR(error);
+}
+EXPORT_SYMBOL_GPL(qdx_vsi_alloc);
+
+void qdx_vsi_release(struct qdx_vsi *vsi)
+{
+	if (vsi)
+		queue_work(vsi->physical->service->qdx->cleanup_queue, &vsi->release_work);
+}
+EXPORT_SYMBOL_GPL(qdx_vsi_release);
+
+/* Prepared RX and output uses retain native resources independently. */
+struct qdx_rx_use *qdx_rx_acquire(struct qdx_endpoint *endpoint,
+				struct net_device *dev)
+{
+	struct qdx *qdx = endpoint->service->qdx;
+	struct qdx_rx_use *use;
+	struct qdx_port *port;
+	struct qdx_ppe *ppe;
+	int error;
+
+	if (!qdx_endpoint_command_ready(endpoint))
+		return ERR_PTR(-ESHUTDOWN);
+	port = qdx_port_get(qdx, endpoint->core->id, endpoint->ifnum);
+	if (!port)
+		return ERR_PTR(-ENODEV);
+	if (port->netdev != dev) {
+		error = -EINVAL;
+		goto put_port;
+	}
+	use = kzalloc(sizeof(*use), GFP_KERNEL);
+	if (!use) {
+		error = -ENOMEM;
+		goto put_port;
+	}
+	/* The physical port reference prevents the native provider from passing
+	 * its detach drain. Resource operations never acquire port policy locks.
+	 */
+	ppe = READ_ONCE(qdx->ethernet->ppe);
+	if (!ppe || READ_ONCE(ppe->detaching) || atomic_read(&qdx->failure)) {
+		error = -ESHUTDOWN;
+		goto free;
+	}
+	use->scope = ppe->info.ops->rx_acquire(ppe->info.context, port->ifnum);
+	if (IS_ERR(use->scope)) {
+		error = PTR_ERR(use->scope);
+		goto free;
+	}
+	qdx_endpoint_hold(endpoint);
+	use->endpoint = endpoint;
+	use->port = port;
+	use->ppe = ppe;
+	return use;
+free:
+	kfree(use);
+put_port:
+	qdx_port_put(port);
+	return ERR_PTR(error);
+}
+EXPORT_SYMBOL_GPL(qdx_rx_acquire);
+
+int qdx_rx_hold(struct qdx_rx_use *use)
+{
+	int error;
+
+	if (qdx_service_access_ended(use->endpoint->service))
+		return 0;
+	error = use->ppe->info.ops->rx_hold(use->ppe->info.context, use->scope);
+	if (error)
+		qdx_stop_execution(use->endpoint->service, error);
+	return error;
+}
+EXPORT_SYMBOL_GPL(qdx_rx_hold);
+
+int qdx_rx_release(struct qdx_rx_use *use)
+{
+	int error;
+
+	if (!use)
+		return 0;
+	error = use->ppe->info.ops->rx_release(use->ppe->info.context, use->scope);
+	if (error) {
+		qdx_stop_execution(use->endpoint->service, error);
+		return error; /* The exact old reservation and references remain held. */
+	}
+	qdx_endpoint_put(use->endpoint);
+	qdx_port_put(use->port);
+	kfree(use);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qdx_rx_release);
+
+static void qdx_tx_path_free(struct work_struct *work)
+{
+	struct qdx_tx_path *path = container_of(work, struct qdx_tx_path, release_work);
+
+	/* A last DMA return can run in NAPI. The actual hardware-resource release
+	 * is sleepable and precedes ending the native provider's detach reference.
+	 */
+	path->ppe->info.ops->tx_release(path->ppe->info.context, path->scope);
+	/* The last carrier can precede this sleepable native scope cleanup.
+	 * Retiring owners recheck their real queue state after this progress.
+	 */
+	qdx_resource_progress(path->endpoint->core, QDX_RESOURCE_CARRIER);
+	qdx_endpoint_put(path->endpoint);
+	qdx_port_put(path->port);
+	kfree(path);
+}
+
+struct qdx_tx_path *qdx_tx_prepare(struct qdx_endpoint *endpoint,
+		struct net_device *dev, u16 queue, struct qdx_tx_class class,
+		enum qdx_disposition disposition)
+{
+	struct qdx *qdx = endpoint->service->qdx;
+	struct qdx_tx_path *path;
+	struct qdx_port *port;
+	struct qdx_ppe *ppe;
+	int error;
+
+	if (!class.token || disposition == QDX_NATIVE || disposition > QDX_REQUIRED ||
+	    queue >= dev->num_tx_queues)
+		return ERR_PTR(-EINVAL);
+	if (!qdx_endpoint_command_ready(endpoint))
+		return ERR_PTR(-ESHUTDOWN);
+	port = qdx_port_get(qdx, endpoint->core->id, endpoint->ifnum);
+	if (!port)
+		return ERR_PTR(-ENODEV);
+	if (port->netdev != dev) {
+		error = -EINVAL;
+		goto put_port;
+	}
+	path = kzalloc(sizeof(*path), GFP_KERNEL);
+	if (!path) {
+		error = -ENOMEM;
+		goto put_port;
+	}
+	ppe = READ_ONCE(qdx->ethernet->ppe);
+	if (!ppe || READ_ONCE(ppe->detaching) || atomic_read(&qdx->failure)) {
+		error = -ESHUTDOWN;
+		goto free;
+	}
+	path->scope = ppe->info.ops->tx_prepare(ppe->info.context, port->ifnum, queue);
+	if (IS_ERR(path->scope)) {
+		error = PTR_ERR(path->scope);
+		goto free;
+	}
+	qdx_endpoint_hold(endpoint);
+	path->endpoint = endpoint;
+	path->port = port;
+	path->ppe = ppe;
+	path->queue = queue;
+	path->class = class;
+	path->disposition = disposition;
+	INIT_WORK(&path->release_work, qdx_tx_path_free);
+	refcount_set(&path->refs, 1);
+	smp_store_release(&path->open, true);
+	return path;
+free:
+	kfree(path);
+put_port:
+	qdx_port_put(port);
+	return ERR_PTR(error);
+}
+EXPORT_SYMBOL_GPL(qdx_tx_prepare);
+
+void qdx_tx_path_get(struct qdx_tx_path *path)
+{
+	refcount_inc(&path->refs);
+}
+EXPORT_SYMBOL_GPL(qdx_tx_path_get);
+
+void qdx_tx_path_put(struct qdx_tx_path *path)
+{
+	if (refcount_dec_and_test(&path->refs))
+		queue_work(path->endpoint->service->qdx->cleanup_queue, &path->release_work);
+}
+EXPORT_SYMBOL_GPL(qdx_tx_path_put);
+
+int qdx_tx_hold(struct qdx_tx_path *path)
+{
+	int error;
+
+	qdx_io_tx_close(path);
+	if (qdx_service_access_ended(path->endpoint->service))
+		return 0;
+	error = path->ppe->info.ops->tx_hold(path->ppe->info.context, path->scope);
+	if (error)
+		qdx_stop_execution(path->endpoint->service, error);
+	return error;
+}
+EXPORT_SYMBOL_GPL(qdx_tx_hold);
+
+void qdx_tx_release(struct qdx_tx_path *path)
+{
+	if (!path)
+		return;
+	qdx_io_tx_close(path);
+	qdx_tx_path_put(path);
+}
+EXPORT_SYMBOL_GPL(qdx_tx_release);
+
+void qdx_edma_resolve(struct qdx_edma *edma, unsigned int port, u16 queue,
+		      u64 token, enum qdx_disposition disposition,
+		      struct qdx_tx_selection *selection)
+{
+	struct qdx_ppe *ppe;
+	struct qdx *qdx;
+
+	*selection = (struct qdx_tx_selection) {
+		.status = token || disposition != QDX_NATIVE ?
+			  QDX_TX_REFUSED : QDX_TX_NATIVE,
+		.disposition = disposition,
+	};
+	if (!edma)
+		return;
+	rcu_read_lock();
+	qdx = READ_ONCE(edma->qdx);
+	if (!qdx)
+		goto out;
+	ppe = READ_ONCE(qdx->ethernet->ppe);
+	if (ppe && !READ_ONCE(ppe->detaching))
+		ppe->info.ops->resolve_tx(ppe->info.context, port, queue, token,
+					 disposition, selection);
+out:
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL_GPL(qdx_edma_resolve);
+
+void qdx_tx_selection_put(struct qdx_tx_selection *selection)
+{
+	if (selection->owner.object)
+		qdx_owner_put(&selection->owner);
+	memset(selection, 0, sizeof(*selection));
+}
+EXPORT_SYMBOL_GPL(qdx_tx_selection_put);
+
+int qdx_ppe_map_rx_queue(struct qdx_ppe *ppe, u16 queue, bool firmware)
+{
+	struct qdx_edma *edma;
+
+	if (!ppe || !ppe->qdx)
+		return -ENODEV;
+	/* The caller's real RX reservation retains the physical/native provider.
+	 * Native hardware control is process context, never a fast-path lock.
+	 */
+	edma = READ_ONCE(ppe->qdx->ethernet->edma);
+	if (!edma || (firmware && READ_ONCE(edma->detaching)))
+		return -ENODEV;
+	return edma->info.ops->map_rx_queue(edma->info.context, queue, firmware);
+}
+EXPORT_SYMBOL_GPL(qdx_ppe_map_rx_queue);
+
+void qdx_ppe_tx_gate(struct qdx_ppe *ppe, bool hold)
+{
+	struct qdx_edma *edma;
+
+	if (!ppe || !ppe->qdx)
+		return;
+	rcu_read_lock();
+	edma = READ_ONCE(ppe->qdx->ethernet->edma);
+	if (edma && !READ_ONCE(edma->detaching))
+		edma->info.ops->tx_gate(edma->info.context, hold);
+	rcu_read_unlock();
+}
+EXPORT_SYMBOL_GPL(qdx_ppe_tx_gate);
+
+void qdx_ppe_tx_progress(struct qdx_ppe *ppe)
+{
+	if (ppe && ppe->qdx)
+		qdx_ethernet_progress(ppe->qdx);
+}
+EXPORT_SYMBOL_GPL(qdx_ppe_tx_progress);

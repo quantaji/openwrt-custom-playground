@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config QDX_FLOW
+	tristate "QDX routed flowtable offload"
+	depends on QDX && NF_FLOW_TABLE && NET_CLS
+	help
+	  Connect native IPv4/IPv6 flowtable offload to the QDX NSS dataplane.
+	  Bridge, VLAN, PPPoE and TC policy remain owned by their corresponding
+	  native subsystems and optional QDX peers.

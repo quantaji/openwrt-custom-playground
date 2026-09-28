@@ -1,0 +1,6 @@
+config QDX_TUNNEL
+	tristate "QDX PPPoE session integration"
+	depends on QDX && PPPOE
+	help
+	  Delegate eligible native PPPoE sessions and preserve their actual
+	  protocol, lower-device and final-accounting lifetimes.

@@ -1,0 +1,534 @@
+Subject: [PATCH] netfilter: retain native hardware flow context and paths
+
+Retain the original two native forward paths only for hardware-requesting
+flowtables. Preserve independently referenced devices and routes beyond the
+native flow lifetime, with owner-side semantic validation and no rerouting.
+Pass the existing rule pair and live native identities through the existing
+block callbacks, preserving directional dispatch and accounting full-width
+hardware deltas without narrowing them at the conntrack boundary.
+
+Signed-off-by: Codex
+
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@ -584,6 +584,8 @@
+ };
+ 
+ struct netlink_ext_ack;
++struct nf_flowtable;
++struct nf_flow_offload_ctx;
+ 
+ struct flow_block_offload {
+ 	enum flow_block_command command;
+@@ -597,6 +599,7 @@
+ 	struct netlink_ext_ack *extack;
+ 	struct Qdisc *sch;
+ 	struct list_head *cb_list_head;
++	struct nf_flowtable *nf_flowtable;
+ };
+ 
+ enum tc_setup_type;
+@@ -697,6 +700,7 @@
+ 	struct flow_rule *rule;
+ 	struct flow_stats stats;
+ 	u32 classid;
++	const struct nf_flow_offload_ctx *nf_flow_ctx;
+ };
+ 
+ enum offload_act_command  {
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -6,6 +6,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/rhashtable-types.h>
+ #include <linux/rcupdate.h>
++#include <linux/refcount.h>
+ #include <linux/netfilter.h>
+ #include <linux/netfilter/nf_conntrack_tuple_common.h>
+ #include <net/flow_offload.h>
+@@ -184,6 +185,7 @@
+ 	unsigned long				flags;
+ 	u16					type;
+ 	u32					timeout;
++	struct nf_flow_hw_path			*hw_path;
+ 	struct rcu_head				rcu_head;
+ };
+ 
+@@ -197,27 +199,61 @@
+ 	return (__s32)(timeout - nf_flowtable_time_stamp);
+ }
+ 
++struct nf_flow_route_tuple {
++	struct dst_entry		*dst;
++	struct {
++		u32			ifindex;
++		struct {
++			u16		id;
++			__be16		proto;
++		} encap[NF_FLOW_TABLE_ENCAP_MAX];
++		u8			num_encaps:2,
++					ingress_vlans:2;
++	} in;
++	struct {
++		u32			ifindex;
++		u32			hw_ifindex;
++		u8			h_source[ETH_ALEN];
++		u8			h_dest[ETH_ALEN];
++	} out;
++	enum flow_offload_xmit_type	xmit_type;
++};
++
+ struct nf_flow_route {
+-	struct {
+-		struct dst_entry		*dst;
+-		struct {
+-			u32			ifindex;
+-			struct {
+-				u16		id;
+-				__be16		proto;
+-			} encap[NF_FLOW_TABLE_ENCAP_MAX];
+-			u8			num_encaps:2,
+-						ingress_vlans:2;
+-		} in;
+-		struct {
+-			u32			ifindex;
+-			u32			hw_ifindex;
+-			u8			h_source[ETH_ALEN];
+-			u8			h_dest[ETH_ALEN];
+-		} out;
+-		enum flow_offload_xmit_type	xmit_type;
+-	} tuple[FLOW_OFFLOAD_DIR_MAX];
+-};
++	struct nf_flow_route_tuple tuple[FLOW_OFFLOAD_DIR_MAX];
++	struct nf_flow_hw_path *hw_path;
++};
++
++/* Immutable native route input/output; references do not grant offload. */
++struct nf_flow_hw_path_dir {
++	struct nf_flow_route_tuple route;
++	union nf_inet_addr neighbour;
++	struct net_device_path_stack stack;
++	u32 dst_cookie;
++	u16 mtu;
++	u8 l3proto;
++};
++
++struct nf_flow_hw_path {
++	refcount_t refs;
++	struct nf_flow_hw_path_dir dir[FLOW_OFFLOAD_DIR_MAX];
++};
++
++/* Context/rules are callback-local. Identity borrows end at native
++ * DESTROY/UNBIND; independent ct/path references have their own lifetimes.
++ */
++struct nf_flow_offload_ctx {
++	struct flow_offload *flow;
++	struct nf_conn *ct;
++	unsigned int direction;
++	unsigned long authorized_directions;
++	const struct flow_rule *rules[FLOW_OFFLOAD_DIR_MAX];
++};
++
++struct nf_flow_hw_path *nf_flow_hw_path_get(const struct flow_offload *flow);
++void nf_flow_hw_path_put(struct nf_flow_hw_path *path);
++/* Caller holds RTNL: 0 usable, -ESTALE changed, -EAGAIN unavailable. */
++int nf_flow_hw_path_validate(const struct nf_flow_hw_path *path);
+ 
+ struct flow_offload *flow_offload_alloc(struct nf_conn *ct);
+ void flow_offload_free(struct flow_offload *flow);
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -7,7 +7,9 @@
+ #include <linux/spinlock.h>
+ #include <linux/netfilter/nf_conntrack_common.h>
+ #include <linux/netfilter/nf_tables.h>
++#include <linux/rtnetlink.h>
+ #include <net/ip.h>
++#include <net/ip6_route.h>
+ #include <net/inet_dscp.h>
+ #include <net/netfilter/nf_tables.h>
+ #include <net/netfilter/nf_tables_core.h>
+@@ -41,13 +43,10 @@
+ 	return true;
+ }
+ 
+-static int nft_dev_fill_forward_path(const struct nf_flow_route *route,
+-				     const struct dst_entry *dst_cache,
+-				     const struct nf_conn *ct,
+-				     enum ip_conntrack_dir dir, u8 *ha,
++static int nft_dev_fill_forward_path(const struct dst_entry *dst_cache,
++				     const union nf_inet_addr *daddr, u8 *ha,
+ 				     struct net_device_path_stack *stack)
+ {
+-	const void *daddr = &ct->tuplehash[!dir].tuple.src.u3;
+ 	struct net_device *dev = dst_cache->dev;
+ 	struct neighbour *n;
+ 	u8 nud_state;
+@@ -91,7 +90,7 @@
+ 
+ static void nft_dev_path_info(const struct net_device_path_stack *stack,
+ 			      struct nft_forward_info *info,
+-			      unsigned char *ha, struct nf_flowtable *flowtable)
++			      unsigned char *ha, bool hw_offload)
+ {
+ 	const struct net_device_path *path;
+ 	int i;
+@@ -167,8 +166,7 @@
+ 
+ 	info->hw_outdev = info->indev;
+ 
+-	if (nf_flowtable_hw_offload(flowtable) &&
+-	    nft_is_valid_ether_device(info->indev))
++	if (hw_offload && nft_is_valid_ether_device(info->indev))
+ 		info->xmit_type = FLOW_OFFLOAD_XMIT_DIRECT;
+ }
+ 
+@@ -195,13 +193,15 @@
+ 				 struct nft_flowtable *ft)
+ {
+ 	const struct dst_entry *dst = route->tuple[dir].dst;
+-	struct net_device_path_stack stack;
++	struct net_device_path_stack stack = {};
+ 	struct nft_forward_info info = {};
+ 	unsigned char ha[ETH_ALEN];
+ 	int i;
+ 
+-	if (nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack) >= 0)
+-		nft_dev_path_info(&stack, &info, ha, &ft->data);
++	if (nft_dev_fill_forward_path(dst, &ct->tuplehash[!dir].tuple.src.u3,
++				      ha, &stack) >= 0)
++		nft_dev_path_info(&stack, &info, ha,
++				  nf_flowtable_hw_offload(&ft->data));
+ 
+ 	if (!info.indev || !nft_flowtable_find_dev(info.indev, ft))
+ 		return;
+@@ -221,6 +221,16 @@
+ 		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
+ 		route->tuple[dir].xmit_type = info.xmit_type;
+ 	}
++
++	if (route->hw_path) {
++		struct nf_flow_hw_path_dir *path = &route->hw_path->dir[dir];
++
++		path->stack = stack;
++		path->neighbour = ct->tuplehash[!dir].tuple.src.u3;
++		path->l3proto = ct->tuplehash[dir].tuple.src.l3num;
++		for (i = 0; i < stack.num_paths; i++)
++			dev_hold((struct net_device *)stack.path[i].dev);
++	}
+ }
+ 
+ int nft_flow_route(const struct nft_pktinfo *pkt, const struct nf_conn *ct,
+@@ -230,7 +240,9 @@
+ 	struct dst_entry *this_dst = skb_dst(pkt->skb);
+ 	struct dst_entry *other_dst = NULL;
+ 	struct flowi fl;
+-
++	int i;
++
++	route->hw_path = NULL;
+ 	memset(&fl, 0, sizeof(fl));
+ 	switch (nft_pf(pkt)) {
+ 	case NFPROTO_IPV4:
+@@ -267,10 +279,167 @@
+ 
+ 	if (route->tuple[dir].xmit_type	== FLOW_OFFLOAD_XMIT_NEIGH &&
+ 	    route->tuple[!dir].xmit_type == FLOW_OFFLOAD_XMIT_NEIGH) {
++		if (nf_flowtable_hw_offload(&ft->data)) {
++			route->hw_path = kzalloc(sizeof(*route->hw_path), GFP_ATOMIC);
++			if (route->hw_path)
++				refcount_set(&route->hw_path->refs, 1);
++		}
+ 		nft_dev_forward_path(route, ct, dir, ft);
+ 		nft_dev_forward_path(route, ct, !dir, ft);
+ 	}
+ 
++	if (route->hw_path) {
++		if (!route->hw_path->dir[0].stack.num_paths ||
++		    !route->hw_path->dir[1].stack.num_paths) {
++			nf_flow_hw_path_put(route->hw_path);
++			route->hw_path = NULL;
++		} else {
++			for (i = 0; i < FLOW_OFFLOAD_DIR_MAX; i++) {
++				struct nf_flow_hw_path_dir *path = &route->hw_path->dir[i];
++				struct dst_entry *dst = route->tuple[i].dst;
++
++				/* Both walks have now filled the opposite ingress. */
++				path->route = route->tuple[i];
++				dst_hold(dst);
++				if (path->l3proto == NFPROTO_IPV6) {
++					path->dst_cookie = rt6_get_cookie(dst_rt6_info(dst));
++					path->mtu = ip6_dst_mtu_maybe_forward(dst, true);
++				} else {
++					path->mtu = ip_dst_mtu_maybe_forward(dst, true);
++				}
++			}
++		}
++	}
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(nft_flow_route);
++
++struct nf_flow_hw_path *nf_flow_hw_path_get(const struct flow_offload *flow)
++{
++	struct nf_flow_hw_path *path = flow->hw_path;
++
++	if (path)
++		refcount_inc(&path->refs);
++	return path;
++}
++EXPORT_SYMBOL_GPL(nf_flow_hw_path_get);
++
++void nf_flow_hw_path_put(struct nf_flow_hw_path *path)
++{
++	int dir, i;
++
++	if (!path || !refcount_dec_and_test(&path->refs))
++		return;
++	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
++		struct nf_flow_hw_path_dir *p = &path->dir[dir];
++
++		for (i = 0; i < p->stack.num_paths; i++)
++			dev_put((struct net_device *)p->stack.path[i].dev);
++		dst_release(p->route.dst);
++	}
++	kfree(path);
++}
++EXPORT_SYMBOL_GPL(nf_flow_hw_path_put);
++
++int nf_flow_hw_path_validate(const struct nf_flow_hw_path *path)
++{
++	int dir, i, err = -ESTALE;
++
++	ASSERT_RTNL();
++	if (!path)
++		return -EAGAIN;
++
++	rcu_read_lock();
++	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
++		const struct nf_flow_hw_path_dir *p = &path->dir[dir];
++		const struct nf_flow_route_tuple *in = &path->dir[!dir].route;
++		struct dst_entry *dst = p->route.dst;
++		struct net_device_path_stack stack = {};
++		struct nft_forward_info info = {};
++		unsigned char ha[ETH_ALEN];
++		u16 mtu;
++
++		if (!dst_check(dst, p->dst_cookie) ||
++		    READ_ONCE(dst->dev->reg_state) != NETREG_REGISTERED)
++			goto out;
++		for (i = 0; i < p->stack.num_paths; i++)
++			if (READ_ONCE(p->stack.path[i].dev->reg_state) != NETREG_REGISTERED)
++				goto out;
++
++		if (nft_dev_fill_forward_path(dst, &p->neighbour, ha, &stack) < 0) {
++			err = -EAGAIN;
++			goto out;
++		}
++		nft_dev_path_info(&stack, &info, ha, true);
++		if (!info.indev) {
++			err = -EAGAIN;
++			goto out;
++		}
++		if (stack.num_paths != p->stack.num_paths)
++			goto out;
++		for (i = 0; i < stack.num_paths; i++) {
++			const struct net_device_path *old = &p->stack.path[i];
++			const struct net_device_path *now = &stack.path[i];
++
++			if (old->type != now->type || old->dev != now->dev)
++				goto out;
++			switch (old->type) {
++			case DEV_PATH_ETHERNET:
++				break;
++			case DEV_PATH_VLAN:
++			case DEV_PATH_PPPOE:
++				if (old->encap.id != now->encap.id ||
++				    old->encap.proto != now->encap.proto)
++					goto out;
++				if (old->type == DEV_PATH_PPPOE &&
++				    !ether_addr_equal(old->encap.h_dest, now->encap.h_dest))
++					goto out;
++				break;
++			case DEV_PATH_BRIDGE:
++				if (old->bridge.vlan_mode != now->bridge.vlan_mode ||
++				    old->bridge.vlan_id != now->bridge.vlan_id ||
++				    old->bridge.vlan_proto != now->bridge.vlan_proto)
++					goto out;
++				break;
++			case DEV_PATH_DSA:
++				if (old->dsa.port != now->dsa.port ||
++				    old->dsa.proto != now->dsa.proto)
++					goto out;
++				break;
++			default:
++				err = -EAGAIN;
++				goto out;
++			}
++		}
++		if (info.indev->ifindex != in->in.ifindex ||
++		    info.num_encaps != in->in.num_encaps ||
++		    info.ingress_vlans != in->in.ingress_vlans)
++			goto out;
++		for (i = 0; i < info.num_encaps; i++)
++			if (info.encap[i].id != in->in.encap[i].id ||
++			    info.encap[i].proto != in->in.encap[i].proto)
++				goto out;
++		if (info.xmit_type == FLOW_OFFLOAD_XMIT_DIRECT) {
++			if (p->route.xmit_type != FLOW_OFFLOAD_XMIT_DIRECT ||
++			    info.outdev->ifindex != p->route.out.ifindex ||
++			    info.hw_outdev->ifindex != p->route.out.hw_ifindex ||
++			    !ether_addr_equal(info.h_source, p->route.out.h_source) ||
++			    !ether_addr_equal(info.h_dest, p->route.out.h_dest))
++				goto out;
++		} else if (p->route.xmit_type != nft_xmit_type(dst)) {
++			goto out;
++		}
++		if (p->l3proto == NFPROTO_IPV6)
++			mtu = ip6_dst_mtu_maybe_forward(dst, true);
++		else
++			mtu = ip_dst_mtu_maybe_forward(dst, true);
++		if (mtu != p->mtu)
++			goto out;
++	}
++	err = 0;
++out:
++	rcu_read_unlock();
++	return err;
++}
++EXPORT_SYMBOL_GPL(nf_flow_hw_path_validate);
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -156,6 +156,8 @@
+ {
+ 	flow_offload_fill_route(flow, route, FLOW_OFFLOAD_DIR_ORIGINAL);
+ 	flow_offload_fill_route(flow, route, FLOW_OFFLOAD_DIR_REPLY);
++	flow->hw_path = route->hw_path;
++	route->hw_path = NULL;
+ 	flow->type = NF_FLOW_OFFLOAD_ROUTE;
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_route_init);
+@@ -257,6 +259,7 @@
+ 	default:
+ 		break;
+ 	}
++	nf_flow_hw_path_put(flow->hw_path);
+ 	nf_ct_put(flow->ct);
+ 	kfree_rcu(flow, rcu_head);
+ }
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -126,6 +126,7 @@
+ err_flow_add:
+ 	flow_offload_free(flow);
+ err_flow_alloc:
++	nf_flow_hw_path_put(route.hw_path);
+ 	dst_release(route.tuple[dir].dst);
+ 	dst_release(route.tuple[!dir].dst);
+ err_flow_route:
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -898,12 +898,18 @@
+ 
+ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+ 				 struct flow_offload *flow,
+-				 struct nf_flow_rule *flow_rule,
++				 struct nf_flow_rule *flow_rule[],
+ 				 enum flow_offload_tuple_dir dir,
+ 				 int priority, int cmd,
+ 				 struct flow_stats *stats,
+ 				 struct list_head *block_cb_list)
+ {
++	struct nf_flow_offload_ctx context = {
++		.flow = flow,
++		.ct = flow->ct,
++		.direction = dir,
++		.authorized_directions = BIT(FLOW_OFFLOAD_DIR_ORIGINAL),
++	};
+ 	struct flow_cls_offload cls_flow = {};
+ 	struct netlink_ext_ack extack = {};
+ 	struct flow_block_cb *block_cb;
+@@ -912,8 +918,14 @@
+ 
+ 	nf_flow_offload_init(&cls_flow, proto, priority, cmd,
+ 			     &flow->tuplehash[dir].tuple, &extack);
+-	if (cmd == FLOW_CLS_REPLACE)
+-		cls_flow.rule = flow_rule->rule;
++	if (test_bit(NF_FLOW_HW_BIDIRECTIONAL, &flow->flags))
++		context.authorized_directions |= BIT(FLOW_OFFLOAD_DIR_REPLY);
++	if (cmd == FLOW_CLS_REPLACE) {
++		context.rules[0] = flow_rule[0]->rule;
++		context.rules[1] = flow_rule[1]->rule;
++		cls_flow.rule = flow_rule[dir]->rule;
++	}
++	cls_flow.nf_flow_ctx = &context;
+ 
+ 	down_read(&flowtable->flow_block_lock);
+ 	list_for_each_entry(block_cb, block_cb_list, list) {
+@@ -933,7 +945,7 @@
+ }
+ 
+ static int flow_offload_tuple_add(struct flow_offload_work *offload,
+-				  struct nf_flow_rule *flow_rule,
++				  struct nf_flow_rule *flow_rule[],
+ 				  enum flow_offload_tuple_dir dir)
+ {
+ 	return nf_flow_offload_tuple(offload->flowtable, offload->flow,
+@@ -957,10 +969,10 @@
+ {
+ 	int ok_count = 0;
+ 
+-	ok_count += flow_offload_tuple_add(offload, flow_rule[0],
++	ok_count += flow_offload_tuple_add(offload, flow_rule,
+ 					   FLOW_OFFLOAD_DIR_ORIGINAL);
+ 	if (test_bit(NF_FLOW_HW_BIDIRECTIONAL, &offload->flow->flags))
+-		ok_count += flow_offload_tuple_add(offload, flow_rule[1],
++		ok_count += flow_offload_tuple_add(offload, flow_rule,
+ 						   FLOW_OFFLOAD_DIR_REPLY);
+ 	if (ok_count == 0)
+ 		return -ENOENT;
+@@ -1010,6 +1022,7 @@
+ {
+ 	struct flow_stats stats[FLOW_OFFLOAD_DIR_MAX] = {};
+ 	u64 lastused;
++	int dir;
+ 
+ 	flow_offload_tuple_stats(offload, FLOW_OFFLOAD_DIR_ORIGINAL, &stats[0]);
+ 	if (test_bit(NF_FLOW_HW_BIDIRECTIONAL, &offload->flow->flags))
+@@ -1021,14 +1034,19 @@
+ 				       lastused + flow_offload_get_timeout(offload->flow));
+ 
+ 	if (offload->flowtable->flags & NF_FLOWTABLE_COUNTER) {
+-		if (stats[0].pkts)
+-			nf_ct_acct_add(offload->flow->ct,
+-				       FLOW_OFFLOAD_DIR_ORIGINAL,
+-				       stats[0].pkts, stats[0].bytes);
+-		if (stats[1].pkts)
+-			nf_ct_acct_add(offload->flow->ct,
+-				       FLOW_OFFLOAD_DIR_REPLY,
+-				       stats[1].pkts, stats[1].bytes);
++		for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
++			u64 packets = stats[dir].pkts;
++			u64 bytes = stats[dir].bytes;
++
++			while (packets || bytes) {
++				u32 p = min_t(u64, packets, U32_MAX);
++				u32 b = min_t(u64, bytes, U32_MAX);
++
++				nf_ct_acct_add(offload->flow->ct, dir, p, b);
++				packets -= p;
++				bytes -= b;
++			}
++		}
+ 	}
+ }
+ 
+@@ -1195,6 +1213,7 @@
+ 	memset(bo, 0, sizeof(*bo));
+ 	bo->net		= net;
+ 	bo->block	= &flowtable->flow_block;
++	bo->nf_flowtable = flowtable;
+ 	bo->command	= cmd;
+ 	bo->binder_type	= FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS;
+ 	bo->extack	= extack;

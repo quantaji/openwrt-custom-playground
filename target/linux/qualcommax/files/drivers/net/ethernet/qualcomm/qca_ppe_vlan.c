@@ -169,9 +169,15 @@ int qca_ppe_vlan_setup(struct dsa_switch *ds)
 		u32 mode = dsa_is_user_port(ds, i) ?
 			   PPE_EG_UNMODIFIED : PPE_EG_UNTOUCHED;
 
-		regmap_update_bits(priv->regmap, PPE_PORT_EG_VLAN(i),
-				   PPE_PORT_EG_VLAN_CTAG_MODE |
-				   PPE_PORT_EG_VLAN_STAG_MODE,
+		u32 mask = PPE_PORT_EG_VLAN_CTAG_MODE |
+			   PPE_PORT_EG_VLAN_STAG_MODE;
+
+		/* CPU delivery must preserve the received tags even when a VSI
+		 * selects a different representation for physical egress.
+		 */
+		if (dsa_is_cpu_port(ds, i))
+			mask |= PPE_PORT_EG_VSI_TAG_EN;
+		regmap_update_bits(priv->regmap, PPE_PORT_EG_VLAN(i), mask,
 				   FIELD_PREP(PPE_PORT_EG_VLAN_CTAG_MODE, mode) |
 				   FIELD_PREP(PPE_PORT_EG_VLAN_STAG_MODE, mode));
 	}

@@ -375,5 +375,152 @@ void qdx_mem_release(struct qdx *qdx, bool access_ended)
 	}
 }
 
+/* Feature regions are accounted separately from boot memory and RX supplies. */
+struct qdx_dma {
+	struct list_head node;
+	struct qdx_service *service;
+	void *base;
+	void *cpu;
+	dma_addr_t base_dma;
+	dma_addr_t dma;
+	size_t allocation;
+	size_t length;
+	enum dma_data_direction direction;
+	bool exposed;
+	bool release_pending;
+};
+
+static void qdx_dma_free(struct qdx_dma *region)
+{
+	struct qdx_service *service = region->service;
+
+	dma_free_coherent(service->qdx->dev, region->allocation, region->base,
+			  region->base_dma);
+	atomic_long_sub(region->allocation, &service->qdx->peer_dma_used);
+	kfree(region);
+	qdx_service_put(service);
+}
+
+struct qdx_dma *qdx_dma_alloc(struct qdx_service *service, size_t length,
+			     size_t alignment, enum dma_data_direction direction)
+{
+	struct qdx *qdx = service->qdx;
+	struct qdx_dma *region;
+	size_t allocation, offset, extra;
+	long used;
+	int error = -ENOMEM;
+
+	if (!length || !is_power_of_2(alignment) || alignment > SZ_1M ||
+	    direction == DMA_NONE)
+		return ERR_PTR(-EINVAL);
+	/* Coherent allocations are already page aligned; charge all real pages. */
+	extra = alignment > PAGE_SIZE ? alignment - PAGE_SIZE : 0;
+	if (check_add_overflow(length, extra, &allocation) ||
+	    allocation > LONG_MAX - (PAGE_SIZE - 1))
+		return ERR_PTR(-EOVERFLOW);
+	allocation = PAGE_ALIGN(allocation);
+	if (qdx_service_state(service) != QDX_AVAILABLE)
+		return ERR_PTR(-EAGAIN);
+	used = atomic_long_read(&qdx->peer_dma_used);
+	do {
+		if (used < 0 || used > qdx->limits.peer_dma_bytes ||
+		    allocation > qdx->limits.peer_dma_bytes - used)
+			return ERR_PTR(-ENOSPC);
+	} while (!atomic_long_try_cmpxchg(&qdx->peer_dma_used, &used, used + allocation));
+	region = kzalloc(sizeof(*region), GFP_KERNEL);
+	if (!region)
+		goto uncharge;
+	region->base = dma_alloc_coherent(qdx->dev, allocation, &region->base_dma, GFP_KERNEL);
+	if (!region->base)
+		goto free_region;
+	region->dma = ALIGN(region->base_dma, alignment);
+	offset = region->dma - region->base_dma;
+	if ((u64)region->base_dma + allocation > BIT_ULL(32) ||
+	    (u64)region->dma + length > BIT_ULL(32)) {
+		error = -ERANGE;
+		goto free_dma;
+	}
+	region->cpu = region->base + offset;
+	region->length = length;
+	region->allocation = allocation;
+	region->direction = direction;
+	region->service = service;
+	qdx_service_hold(service);
+	mutex_lock(&qdx->region_lock);
+	list_add_tail(&region->node, &qdx->regions);
+	mutex_unlock(&qdx->region_lock);
+	return region;
+free_dma:
+	dma_free_coherent(qdx->dev, allocation, region->base, region->base_dma);
+free_region:
+	kfree(region);
+uncharge:
+	atomic_long_sub(allocation, &qdx->peer_dma_used);
+	return ERR_PTR(error);
+}
+EXPORT_SYMBOL_GPL(qdx_dma_alloc);
+
+void *qdx_dma_cpu(struct qdx_dma *region)
+{
+	return region->cpu;
+}
+EXPORT_SYMBOL_GPL(qdx_dma_cpu);
+
+dma_addr_t qdx_dma_address(const struct qdx_dma *region)
+{
+	return region->dma;
+}
+EXPORT_SYMBOL_GPL(qdx_dma_address);
+
+void qdx_dma_expose(struct qdx_dma *region)
+{
+	WRITE_ONCE(region->exposed, true);
+}
+EXPORT_SYMBOL_GPL(qdx_dma_expose);
+
+void qdx_dma_access_end(struct qdx_dma *region)
+{
+	WRITE_ONCE(region->exposed, false);
+}
+EXPORT_SYMBOL_GPL(qdx_dma_access_end);
+
+void qdx_dma_release(struct qdx_dma *region)
+{
+	struct qdx *qdx;
+	bool release;
+
+	if (!region)
+		return;
+	qdx = region->service->qdx;
+	mutex_lock(&qdx->region_lock);
+	release = !READ_ONCE(region->exposed) || smp_load_acquire(&qdx->access_ended);
+	if (release)
+		list_del(&region->node);
+	else
+		region->release_pending = true;
+	mutex_unlock(&qdx->region_lock);
+	if (release)
+		qdx_dma_free(region);
+}
+EXPORT_SYMBOL_GPL(qdx_dma_release);
+
+void qdx_dma_end_all(struct qdx *qdx)
+{
+	struct qdx_dma *region, *next;
+	LIST_HEAD(release);
+
+	mutex_lock(&qdx->region_lock);
+	list_for_each_entry_safe(region, next, &qdx->regions, node) {
+		WRITE_ONCE(region->exposed, false);
+		if (region->release_pending)
+			list_move_tail(&region->node, &release);
+	}
+	mutex_unlock(&qdx->region_lock);
+	list_for_each_entry_safe(region, next, &release, node) {
+		list_del(&region->node);
+		qdx_dma_free(region);
+	}
+}
+
 MODULE_FIRMWARE("qdx/11.4/retail_router0.bin");
 MODULE_FIRMWARE("qdx/11.4/retail_router1.bin");

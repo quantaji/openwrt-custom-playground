@@ -130,6 +130,8 @@
 /* QID to ring mapping */
 #define EDMA_QID2RID_TABLE_MEM(q) (0x5a000 + (0x4 * (q)))
 #define EDMA_QID2RID_QUEUE0_MASK GENMASK(3, 0)
+#define EDMA_QID2RID_UNICAST_QUEUES 256
+#define EDMA_QID2RID_QUEUES_PER_WORD 8
 #define EDMA_RING_MAP_MASK 0x7
 #define EDMA_RING_MAP_BITS 3
 #define EDMA_RING_MAP_ENTRIES 10
@@ -240,10 +242,36 @@ struct edma_ring {
 	void *desc;
 	dma_addr_t dma;
 	u16 count;
-	struct sk_buff **skb_store;
-	dma_addr_t *dma_store;
-	u32 *length_store;
+	struct edma_tx_slot *tx;
 	struct page **page_store;
+};
+
+struct edma_tx_slot {
+	struct sk_buff *skb;
+	dma_addr_t dma;
+	u32 mapped;
+	u32 bytes;
+	struct netdev_queue *queue;
+};
+
+enum edma_tx_wait_reason {
+	EDMA_TX_WAIT_NONE,
+	EDMA_TX_WAIT_RESOURCE,
+	EDMA_TX_WAIT_DISPOSITION,
+};
+
+struct edma_tx_wait {
+	enum qdx_tx_selection_status status;
+	struct qdx_resource_wait resource;
+	struct netdev_queue *queue;
+	enum edma_tx_wait_reason reason;
+	enum qdx_disposition disposition;
+	u64 token;
+	size_t charge;
+	u16 user_queue;
+	u16 native_slots;
+	u8 port;
+	bool tagged;
 };
 
 struct edma_priv {
@@ -271,6 +299,11 @@ struct edma_priv {
 
 	spinlock_t tx_lock;
 	spinlock_t completion_lock;
+	struct edma_tx_wait wait;
+	bool tx_admin;
+	bool detaching;
+	u32 tx_transitions;
+	struct list_head ft_bindings;
 
 	int txcmpl_irq;
 	int rxfill_irq;

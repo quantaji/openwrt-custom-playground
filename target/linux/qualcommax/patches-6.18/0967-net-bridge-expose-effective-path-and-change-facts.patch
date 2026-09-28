@@ -1,0 +1,275 @@
+From: Codex <codex@openai.com>
+Date: Sat, 12 Sep 2026 20:49:10 +0000
+Subject: [PATCH] net: bridge: expose current path state and committed changes
+
+Expose the native bridge data-state gate for a resolved VID and report
+committed FDB/VLAN/MST changes through the existing switchdev chains.
+Keep hardware-install notifications distinct from observations. Include
+partially committed VLAN option changes and emit before fallible netlink
+allocation, without changing native configuration return values.
+
+Signed-off-by: Codex <codex@openai.com>
+---
+
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -173,7 +173,15 @@
+ }
+ #endif
+ 
++struct br_path_state {
++	bool rx;
++	bool tx;
++};
++
+ #if IS_ENABLED(CONFIG_BRIDGE)
++/* Caller holds RTNL and supplies the VID resolved at this native position. */
++int br_path_state(const struct net_device *dev, u16 vid,
++		  struct br_path_state *state);
+ struct net_device *br_fdb_find_port(const struct net_device *br_dev,
+ 				    const unsigned char *addr,
+ 				    __u16 vid);
+@@ -182,6 +190,14 @@
+ u8 br_port_get_stp_state(const struct net_device *dev);
+ clock_t br_get_ageing_time(const struct net_device *br_dev);
+ #else
++static inline int br_path_state(const struct net_device *dev, u16 vid,
++				struct br_path_state *state)
++{
++	state->rx = false;
++	state->tx = false;
++	return -EOPNOTSUPP;
++}
++
+ static inline struct net_device *
+ br_fdb_find_port(const struct net_device *br_dev,
+ 		 const unsigned char *addr,
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -230,6 +230,10 @@
+ 	SWITCHDEV_BRPORT_OFFLOADED,
+ 	SWITCHDEV_BRPORT_UNOFFLOADED,
+ 	SWITCHDEV_BRPORT_REPLAY,
++
++	/* Committed observations; neither requests nor offload acknowledgments. */
++	SWITCHDEV_FDB_CHANGED, /* Atomic; info.dev is the bridge. */
++	SWITCHDEV_VLAN_CHANGED, /* Blocking; info.dev is the bridge. */
+ };
+ 
+ struct switchdev_notifier_info {
+@@ -255,6 +259,20 @@
+ 	struct switchdev_notifier_info info; /* must be first */
+ 	const struct switchdev_obj *obj;
+ 	bool handled;
++};
++
++enum switchdev_vlan_change_scope {
++	SWITCHDEV_VLAN_CHANGE_RANGE,
++	SWITCHDEV_VLAN_CHANGE_PORT,
++	SWITCHDEV_VLAN_CHANGE_BRIDGE,
++};
++
++struct switchdev_notifier_vlan_info {
++	struct switchdev_notifier_info info; /* must be first */
++	struct net_device *port; /* NULL denotes bridge-wide membership. */
++	enum switchdev_vlan_change_scope scope;
++	u16 vid_begin;
++	u16 vid_end;
+ };
+ 
+ struct switchdev_notifier_port_attr_info {
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -16,6 +16,58 @@
+ #include <linux/if_vlan.h>
+ #include <linux/netfilter_bridge.h>
+ #include "br_private.h"
++
++int br_path_state(const struct net_device *dev, u16 vid,
++		  struct br_path_state *state)
++{
++	struct net_bridge_port *p;
++#ifdef CONFIG_BRIDGE_VLAN_FILTERING
++	struct net_bridge *br;
++	struct net_bridge_vlan_group *vg;
++	struct net_bridge_vlan *v;
++	bool member;
++#endif
++	int err = 0;
++
++	ASSERT_RTNL();
++	state->rx = false;
++	state->tx = false;
++	rcu_read_lock();
++	p = br_port_get_check_rcu(dev);
++	if (p) {
++		state->rx = br_mst_is_enabled(p) ||
++			    READ_ONCE(p->state) == BR_STATE_FORWARDING;
++		state->tx = state->rx;
++	} else if (netif_is_bridge_master(dev)) {
++		state->rx = true;
++		state->tx = true;
++	} else {
++		err = -EINVAL;
++		goto out;
++	}
++
++#ifdef CONFIG_BRIDGE_VLAN_FILTERING
++	br = p ? p->br : netdev_priv(dev);
++	if (!br_opt_get(br, BROPT_VLAN_ENABLED))
++		goto out;
++	vg = p ? nbp_vlan_group_rcu(p) : br_vlan_group_rcu(br);
++	v = br_vlan_find(vg, vid);
++	member = v && br_vlan_should_use(v);
++	if (p) {
++		state->rx &= member && br_vlan_get_state(v) == BR_STATE_FORWARDING;
++		state->tx &= member &&
++			     br_vlan_state_allowed(br_vlan_get_state(v), false);
++	} else {
++		state->rx = (dev->flags & IFF_PROMISC) ||
++			    (member && br_vlan_state_allowed(br_vlan_get_state(v), false));
++		state->tx = member && br_vlan_state_allowed(br_vlan_get_state(v), true);
++	}
++#endif
++out:
++	rcu_read_unlock();
++	return err;
++}
++EXPORT_SYMBOL_GPL(br_path_state);
+ 
+ /* Don't forward packets to originating port or forwarding disabled */
+ static inline int should_deliver(const struct net_bridge_port *p,
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -178,10 +178,15 @@
+ 		       const struct net_bridge_fdb_entry *fdb, int type,
+ 		       bool swdev_notify)
+ {
++	struct switchdev_notifier_fdb_info info = {
++		.addr = fdb->key.addr.addr,
++		.vid = fdb->key.vlan_id,
++	};
+ 	struct net *net = dev_net(br->dev);
+ 	struct sk_buff *skb;
+ 	int err = -ENOBUFS;
+ 
++	call_switchdev_notifiers(SWITCHDEV_FDB_CHANGED, br->dev, &info.info, NULL);
+ 	if (swdev_notify)
+ 		br_switchdev_fdb_notify(br, fdb, type);
+ 
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -19,6 +19,7 @@
+ #include <linux/if_vlan.h>
+ #include <linux/rhashtable.h>
+ #include <linux/refcount.h>
++#include <net/switchdev.h>
+ 
+ #define BR_HASH_BITS 8
+ #define BR_HASH_SIZE (1 << BR_HASH_BITS)
+@@ -1612,6 +1613,10 @@
+ 		    const struct net_bridge_port *p,
+ 		    u16 vid, u16 vid_range,
+ 		    int cmd);
++void br_vlan_notify_change(const struct net_bridge *br,
++			   const struct net_bridge_port *p,
++			   enum switchdev_vlan_change_scope scope,
++			   u16 vid_begin, u16 vid_end);
+ bool br_vlan_can_enter_range(const struct net_bridge_vlan *v_curr,
+ 			     const struct net_bridge_vlan *range_end,
+ 			     u16 pvid);
+@@ -1857,6 +1862,13 @@
+ 				  const struct net_bridge_port *p,
+ 				  u16 vid, u16 vid_range,
+ 				  int cmd)
++{
++}
++
++static inline void br_vlan_notify_change(const struct net_bridge *br,
++					 const struct net_bridge_port *p,
++					 enum switchdev_vlan_change_scope scope,
++					 u16 vid_begin, u16 vid_end)
+ {
+ }
+ 
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -1904,6 +1904,23 @@
+ 		+ br_vlan_opts_nl_size(); /* bridge vlan options */
+ }
+ 
++void br_vlan_notify_change(const struct net_bridge *br,
++			   const struct net_bridge_port *p,
++			   enum switchdev_vlan_change_scope scope,
++			   u16 vid_begin, u16 vid_end)
++{
++	struct switchdev_notifier_vlan_info info = {
++		.port = p ? p->dev : NULL,
++		.scope = scope,
++		.vid_begin = vid_begin,
++		.vid_end = vid_end,
++	};
++
++	ASSERT_RTNL();
++	call_switchdev_blocking_notifiers(SWITCHDEV_VLAN_CHANGED, br->dev,
++					  &info.info, NULL);
++}
++
+ void br_vlan_notify(const struct net_bridge *br,
+ 		    const struct net_bridge_port *p,
+ 		    u16 vid, u16 vid_range,
+@@ -1921,6 +1938,8 @@
+ 
+ 	/* right now notifications are done only with rtnl held */
+ 	ASSERT_RTNL();
++	br_vlan_notify_change(br, p, SWITCHDEV_VLAN_CHANGE_RANGE,
++			      vid, vid_range ? vid_range : vid);
+ 
+ 	if (p) {
+ 		ifindex = p->dev->ifindex;
+--- a/net/bridge/br_vlan_options.c
++++ b/net/bridge/br_vlan_options.c
+@@ -299,8 +299,11 @@
+ 
+ 		err = br_vlan_process_one_opts(br, p, vg, v, tb, &changed,
+ 					       extack);
+-		if (err)
++		if (err) {
++			if (changed)
++				br_vlan_notify(br, p, vid, 0, RTM_NEWVLAN);
+ 			break;
++		}
+ 
+ 		if (changed) {
+ 			/* vlan options changed, check for range */
+--- a/net/bridge/br_mst.c
++++ b/net/bridge/br_mst.c
+@@ -186,6 +186,8 @@
+ 			br_mst_vlan_sync_state(pv, msti);
+ 	}
+ 
++	br_vlan_notify_change(mv->br, NULL, SWITCHDEV_VLAN_CHANGE_RANGE,
++			      mv->vid, mv->vid);
+ 	return 0;
+ }
+ 
+@@ -236,6 +238,7 @@
+ 		static_branch_dec(&br_mst_used);
+ 
+ 	br_opt_toggle(br, BROPT_MST_ENABLED, on);
++	br_vlan_notify_change(br, NULL, SWITCHDEV_VLAN_CHANGE_BRIDGE, 0, 0);
+ 	return 0;
+ }
+ 
+@@ -328,7 +331,10 @@
+ 	msti = nla_get_u16(tb[IFLA_BRIDGE_MST_ENTRY_MSTI]);
+ 	state = nla_get_u8(tb[IFLA_BRIDGE_MST_ENTRY_STATE]);
+ 
+-	return br_mst_set_state(p, msti, state, extack);
++	err = br_mst_set_state(p, msti, state, extack);
++	if (!err)
++		br_vlan_notify_change(p->br, p, SWITCHDEV_VLAN_CHANGE_PORT, 0, 0);
++	return err;
+ }
+ 
+ int br_mst_process(struct net_bridge_port *p, const struct nlattr *mst_attr,

@@ -1,0 +1,177 @@
+From: Codex
+Subject: [PATCH] tc: show native and device queue observations separately
+
+Print the distinct device-stage attributes in the common statistics
+printer. Keep native algorithm-specific printers and legacy combined
+statistics behavior unchanged.
+
+Signed-off-by: Codex
+---
+diff --git a/include/uapi/linux/gen_stats.h b/include/uapi/linux/gen_stats.h
+index 852f234..90b5077 100644
+--- a/include/uapi/linux/gen_stats.h
++++ b/include/uapi/linux/gen_stats.h
+@@ -14,6 +14,8 @@ enum {
+ 	TCA_STATS_PAD,
+ 	TCA_STATS_BASIC_HW,
+ 	TCA_STATS_PKT64,
++	TCA_STATS_QUEUE_HW,
++	TCA_STATS_APP_HW,
+ 	__TCA_STATS_MAX,
+ };
+ #define TCA_STATS_MAX (__TCA_STATS_MAX - 1)
+@@ -64,6 +66,50 @@ struct gnet_stats_queue {
+ 	__u32	overlimits;
+ };
+ 
++/* QUEUE_HW presence identifies an independent device queue stage. Its counters
++ * are not a subset of BASIC/QUEUE, and must not be subtracted from those values.
++ */
++enum {
++	GNET_STATS_HW_ENQUEUE_DROP_PACKETS = 1ULL << 0,
++	GNET_STATS_HW_ENQUEUE_DROP_BYTES   = 1ULL << 1,
++	GNET_STATS_HW_DEQUEUE_DROP_PACKETS = 1ULL << 2,
++	GNET_STATS_HW_DEQUEUE_DROP_BYTES   = 1ULL << 3,
++	GNET_STATS_HW_OVERRUNS             = 1ULL << 4,
++	GNET_STATS_HW_QLEN                = 1ULL << 5,
++	GNET_STATS_HW_BACKLOG             = 1ULL << 6,
++};
++
++struct gnet_stats_queue_hw {
++	__u64 valid;
++	__u64 enqueue_drop_packets;
++	__u64 enqueue_drop_bytes;
++	__u64 dequeue_drop_packets;
++	__u64 dequeue_drop_bytes;
++	__u64 overruns;
++	__u64 qlen;
++	__u64 backlog;
++};
++
++enum {
++	GNET_STATS_HW_NEW_FLOWS    = 1ULL << 0,
++	GNET_STATS_HW_ECN_MARKS    = 1ULL << 1,
++	GNET_STATS_HW_NEW_LIST_LEN = 1ULL << 2,
++	GNET_STATS_HW_OLD_LIST_LEN = 1ULL << 3,
++	GNET_STATS_HW_MAXPACKET    = 1ULL << 4,
++	GNET_STATS_HW_PEAK_DELAY   = 1ULL << 5,
++};
++
++/* Normalized observations, independent of each software algorithm's APP ABI. */
++struct gnet_stats_app_hw {
++	__u64 valid;
++	__u64 new_flows;
++	__u64 ecn_marks;
++	__u64 new_list_len;
++	__u64 old_list_len;
++	__u64 maxpacket;
++	__u64 peak_delay_ns;
++};
++
+ /**
+  * struct gnet_estimator - rate estimator configuration
+  * @interval: sampling period
+diff --git a/tc/tc_util.c b/tc/tc_util.c
+index 45d76e7..e54da3d 100644
+--- a/tc/tc_util.c
++++ b/tc/tc_util.c
+@@ -723,6 +723,62 @@ static void print_tcstats_basic_hw(struct rtattr **tbs, const char *prefix,
+ 	print_lluint(PRINT_ANY, "hw_packets", " %llu pkt", packets64_hw);
+ }
+ 
++static void print_tcstats_device(struct rtattr **tbs, const char *prefix,
++				  __u64 packets64)
++{
++	struct gnet_stats_queue_hw queue = {};
++	struct gnet_stats_app_hw app = {};
++	struct gnet_stats_basic basic = {};
++
++	memcpy(&queue, RTA_DATA(tbs[TCA_STATS_QUEUE_HW]),
++	       MIN(RTA_PAYLOAD(tbs[TCA_STATS_QUEUE_HW]), sizeof(queue)));
++	open_json_object("device");
++	print_nl();
++	print_string(PRINT_FP, NULL, "%sDevice queue:", prefix);
++	if (tbs[TCA_STATS_BASIC_HW]) {
++		memcpy(&basic, RTA_DATA(tbs[TCA_STATS_BASIC_HW]),
++		       MIN(RTA_PAYLOAD(tbs[TCA_STATS_BASIC_HW]), sizeof(basic)));
++		print_lluint(PRINT_ANY, "bytes", " Sent %llu bytes", basic.bytes);
++		print_lluint(PRINT_ANY, "packets", " %llu pkt",
++			     packets64 ? : basic.packets);
++	}
++	if (queue.valid & GNET_STATS_HW_ENQUEUE_DROP_PACKETS)
++		print_lluint(PRINT_ANY, "enqueue_drop_packets", " enqueue_drop %llu pkt",
++			     queue.enqueue_drop_packets);
++	if (queue.valid & GNET_STATS_HW_ENQUEUE_DROP_BYTES)
++		print_lluint(PRINT_ANY, "enqueue_drop_bytes", " %llu bytes",
++			     queue.enqueue_drop_bytes);
++	if (queue.valid & GNET_STATS_HW_DEQUEUE_DROP_PACKETS)
++		print_lluint(PRINT_ANY, "dequeue_drop_packets", " dequeue_drop %llu pkt",
++			     queue.dequeue_drop_packets);
++	if (queue.valid & GNET_STATS_HW_DEQUEUE_DROP_BYTES)
++		print_lluint(PRINT_ANY, "dequeue_drop_bytes", " %llu bytes",
++			     queue.dequeue_drop_bytes);
++	if (queue.valid & GNET_STATS_HW_OVERRUNS)
++		print_lluint(PRINT_ANY, "overruns", " overruns %llu", queue.overruns);
++	if (queue.valid & GNET_STATS_HW_QLEN)
++		print_lluint(PRINT_ANY, "qlen", " qlen %llu pkt", queue.qlen);
++	if (queue.valid & GNET_STATS_HW_BACKLOG)
++		print_lluint(PRINT_ANY, "backlog", " backlog %llu bytes", queue.backlog);
++	if (tbs[TCA_STATS_APP_HW]) {
++		memcpy(&app, RTA_DATA(tbs[TCA_STATS_APP_HW]),
++		       MIN(RTA_PAYLOAD(tbs[TCA_STATS_APP_HW]), sizeof(app)));
++		if (app.valid & GNET_STATS_HW_NEW_FLOWS)
++			print_lluint(PRINT_ANY, "new_flows", " new_flows %llu", app.new_flows);
++		if (app.valid & GNET_STATS_HW_ECN_MARKS)
++			print_lluint(PRINT_ANY, "ecn_marks", " ecn_marks %llu", app.ecn_marks);
++		if (app.valid & GNET_STATS_HW_NEW_LIST_LEN)
++			print_lluint(PRINT_ANY, "new_list_len", " new_list_len %llu", app.new_list_len);
++		if (app.valid & GNET_STATS_HW_OLD_LIST_LEN)
++			print_lluint(PRINT_ANY, "old_list_len", " old_list_len %llu", app.old_list_len);
++		if (app.valid & GNET_STATS_HW_MAXPACKET)
++			print_lluint(PRINT_ANY, "maxpacket", " maxpacket %llu bytes", app.maxpacket);
++		if (app.valid & GNET_STATS_HW_PEAK_DELAY)
++			print_lluint(PRINT_ANY, "peak_delay_ns", " peak_delay %llu ns", app.peak_delay_ns);
++	}
++	close_json_object();
++}
++
+ static void parse_packets64(const struct rtattr *nest, __u64 *p_packets64,
+ 			    __u64 *p_packets64_hw)
+ {
+@@ -748,9 +804,15 @@ void print_tcstats2_attr(struct rtattr *rta, const char *prefix, struct rtattr *
+ {
+ 	struct rtattr *tbs[TCA_STATS_MAX + 1];
+ 	__u64 packets64 = 0, packets64_hw = 0;
++	bool device_stage;
+ 
+ 	parse_rtattr_nested(tbs, TCA_STATS_MAX, rta);
+ 	parse_packets64(rta, &packets64, &packets64_hw);
++	device_stage = tbs[TCA_STATS_QUEUE_HW] != NULL;
++	if (device_stage) {
++		open_json_object("native");
++		print_string(PRINT_FP, NULL, "%sNative queue: ", prefix);
++	}
+ 
+ 	if (tbs[TCA_STATS_BASIC]) {
+ 		struct gnet_stats_basic bs = {0};
+@@ -778,7 +840,7 @@ void print_tcstats2_attr(struct rtattr *rta, const char *prefix, struct rtattr *
+ 		print_uint(PRINT_ANY, "requeues", " requeues %u) ", q.requeues);
+ 	}
+ 
+-	if (tbs[TCA_STATS_BASIC_HW])
++	if (tbs[TCA_STATS_BASIC_HW] && !device_stage)
+ 		print_tcstats_basic_hw(tbs, prefix, packets64, packets64_hw);
+ 
+ 	if (tbs[TCA_STATS_RATE_EST64]) {
+@@ -815,6 +877,11 @@ void print_tcstats2_attr(struct rtattr *rta, const char *prefix, struct rtattr *
+ 		print_uint(PRINT_FP, NULL, " requeues %u", q.requeues);
+ 	}
+ 
++	if (device_stage) {
++		close_json_object();
++		print_tcstats_device(tbs, prefix, packets64_hw);
++	}
++
+ 	if (xstats)
+ 		*xstats = tbs[TCA_STATS_APP] ? : NULL;
+ }
