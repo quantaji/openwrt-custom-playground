@@ -337,7 +337,10 @@ static int qdx_tc_actions_admit(struct qdx_tc_rule *rule)
 			terminal = action->control == TC_ACT_OK;
 			break;
 		case FLOW_ACTION_REDIRECT:
-			if (i || !last || action->control != TC_ACT_STOLEN ||
+			if ((i && (i != 1 ||
+			     rule->actions[0].id != FLOW_ACTION_PRIORITY ||
+			     rule->actions[0].control != TC_ACT_PIPE)) ||
+			    !last || action->control != TC_ACT_STOLEN ||
 			    (!action->target->rtnl_link_ops ||
 			     strcmp(action->target->rtnl_link_ops->kind, "ifb")))
 				return -EOPNOTSUPP;
@@ -655,7 +658,7 @@ static int qdx_tc_project_tree(const struct qdx_tc_view *view,
 				result->input_priority_used |= !priority_output;
 				result->output_priority_used |= priority_output;
 			}
-			band++;
+			/* Collector and firmware ATTACH use zero-based bands. */
 		}
 		child = NULL;
 		{
@@ -786,7 +789,10 @@ int qdx_tc_project(struct qdx_binding *provider,
 				error = -EOPNOTSUPP;
 				goto unlock;
 			}
-			if (rule->action == QDX_TC_SET_PRIORITY) {
+			if (rule->action == QDX_TC_SET_PRIORITY ||
+			    (rule->action == QDX_TC_REDIRECT_IFB &&
+			     rule->nr_actions == 2 &&
+			     rule->actions[0].id == FLOW_ACTION_PRIORITY)) {
 				facts.priority = rule->priority_after;
 				known.priority = U32_MAX;
 				projection->reference.effects |= QDX_TC_PRIORITY;

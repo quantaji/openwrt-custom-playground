@@ -1,11 +1,203 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/math64.h>
+#include <linux/module.h>
 #include <linux/overflow.h>
 #include <linux/rtnetlink.h>
 #include <linux/slab.h>
 #include <net/codel.h>
 #include <net/red.h>
 #include "tc.h"
+
+/* Isolated 021 measurement only. Native HTB is a class/tag/lifetime carrier;
+ * these nonzero flavors deliberately execute a different firmware law.
+ * Read-only module parameters prevent changing the wire type of live nodes.
+ */
+static unsigned int diag_fairness;
+module_param(diag_fairness, uint, 0400);
+MODULE_PARM_DESC(diag_fairness, "021 diagnostic: 0 unchanged, 1 BF, 2 packet WRR, 3 byte WRR");
+static unsigned int diag_fair_rate_bytes_ps = 12500000;
+module_param(diag_fair_rate_bytes_ps, uint, 0400);
+MODULE_PARM_DESC(diag_fair_rate_bytes_ps, "021 shared outer TBL byte rate (not a native HTB promise)");
+static unsigned int diag_fair_burst_bytes = 65536;
+module_param(diag_fair_burst_bytes, uint, 0400);
+MODULE_PARM_DESC(diag_fair_burst_bytes, "021 shared outer TBL burst, exact-byte M31 encoding");
+static bool diag_fair_unshaped;
+module_param(diag_fair_unshaped, bool, 0400);
+MODULE_PARM_DESC(diag_fair_unshaped, "023 measurement only: packet/byte WRR under one PRIO band, no outer rate gate");
+
+/* One actual wire-root predicate for creation, replay and edge retirement.
+ * The logical HTB identity still supplies only class tags and native lifetime.
+ */
+static bool qdx_tc_diag_fair_prio_root(const struct qdx_tc_node *node)
+{
+	return diag_fair_unshaped && (diag_fairness == 2 || diag_fairness == 3) &&
+		node->tree->explicit_htb && node == node->tree->root;
+}
+
+/* Only the command bytes change. Software node kinds, class selection, tags,
+ * native holds and all existing pending-request/retirement owners stay intact.
+ * Both initial and restored CONFIG use the parameters in that exact message.
+ */
+static int qdx_tc_diag_fair_message(struct qdx_tc_node *node,
+				    struct qdx_shaper_message *message)
+{
+	struct qdx_tc_tree *tree = node->tree;
+	struct qdx_shaper_htb native;
+	u32 opcode = le32_to_cpu(message->command);
+	u32 kind;
+
+	if (!diag_fairness || !tree->explicit_htb)
+		return 0;
+	if (node == tree->root)
+		kind = qdx_tc_diag_fair_prio_root(node) ? QDX_SHAPER_PRIO : QDX_SHAPER_TBL;
+	else if (node == tree->htb_parent)
+		kind = diag_fairness == 1 ? 6 : 9; /* BF / WRR arbiter */
+	else if (node->kind == QDX_SHAPER_HTB_GROUP &&
+		 node->native_class && node->parent == tree->htb_parent)
+		kind = diag_fairness == 1 ? 7 : 10; /* BF / WRR group */
+	else if (node->kind == QDX_SHAPER_FIFO)
+		return 0;
+	else
+		return -EOPNOTSUPP;
+	if (opcode == QDX_SHAPER_ALLOC) {
+		message->data.allocate.kind = cpu_to_le32(kind);
+		return 0;
+	}
+	if (opcode != QDX_SHAPER_CONFIG)
+		return 0;
+	if (qdx_tc_diag_fair_prio_root(node))
+		return -EINVAL; /* A PRIO root has topology, never a TBL CONFIG. */
+	native = message->data.node.parameters.htb;
+	memset(&message->data.node.parameters, 0,
+	       sizeof(message->data.node.parameters));
+	if (node == tree->root) {
+		message->data.node.parameters.tbf.rate.rate_bytes_ps =
+			cpu_to_le32(diag_fair_rate_bytes_ps);
+		message->data.node.parameters.tbf.rate.burst_bytes =
+			cpu_to_le32(diag_fair_burst_bytes);
+		message->data.node.parameters.tbf.rate.max_size = cpu_to_le32(31);
+		message->data.node.parameters.tbf.peak.short_circuit = 1;
+	} else if (node == tree->htb_parent) {
+		if (diag_fairness == 1)
+			return -EINVAL; /* BF arbiter has topology, no CONFIG. */
+		message->data.node.parameters.reserved[0] =
+			cpu_to_le32(diag_fairness == 2 ? 0 : 1);
+	} else {
+		/* BF: quantum, rate, burst, max_size, short_circuit/padding.
+		 * WRR: quantum only, in packets for mode 0 or bytes for mode 1.
+		 */
+		message->data.node.parameters.reserved[0] = native.quantum;
+		if (diag_fairness == 1)
+			memcpy(&message->data.node.parameters.reserved[1],
+			       &native.rate, sizeof(native.rate));
+	}
+	return 0;
+}
+
+/* While held, observe only the synchronous HTB CREATE/ADD identities.
+ * After release, qualify the actual published view and both native storage
+ * leaves. Hold release merely schedules replay and is not completion.
+ * The caller holds RTNL/owner.cfg; view validity uses its existing locks.
+ */
+int qdx_tc_diag_bf_identity(struct qdx_tc_owner *owner, bool held, char *buffer)
+{
+ struct qdx_tc_tree *tree;
+ struct qdx_tc_node *node, *groups[2] = {}, *required[6] = {};
+ struct qdx_tc_view *view;
+ struct Qdisc *native, *leaf;
+ const struct Qdisc_class_ops *class_ops;
+ unsigned long native_classes[2];
+ u32 ifnum;
+ unsigned int i, operation, required_count = 4;
+ bool published;
+ int error;
+
+ ASSERT_RTNL();
+ lockdep_assert_held(&owner->cfg);
+ if (diag_fairness != 1 || owner->closing || !owner->assigned ||
+     owner->ifb_state || owner->direction != QDX_TC_EGRESS ||
+     strcmp(owner->dev->name, "lan2") || !owner->root_allocation)
+  return -EPERM;
+ native = rtnl_dereference(owner->dev->qdisc);
+ tree = owner->root_allocation->tree;
+ if (!native || strcmp(native->ops->id, "htb") || !tree->explicit_htb ||
+     tree->retiring || tree->native_dead || !tree->rooted ||
+     tree->root != owner->root_allocation || tree->root->native != native ||
+     tree->root->kind != QDX_SHAPER_HTB || !tree->htb_parent ||
+     tree->htb_parent->kind != QDX_SHAPER_HTB_GROUP ||
+     tree->htb_parent->parent != tree->root || !tree->htb_parent->linked)
+  return -EBUSY;
+ /* HTB ADD offers a full classid, while native offload replay offers its
+  * minor part and can replace node->classid. Resolve the committed native
+  * objects under RTNL; owner.cfg keeps their corresponding QDX nodes stable.
+  * This observer admits exactly the fixture's two real native classes.
+  */
+ class_ops = native->ops->cl_ops;
+ if (!class_ops || !class_ops->find) return -EOPNOTSUPP;
+ native_classes[0] = class_ops->find(native, 0x10010);
+ native_classes[1] = class_ops->find(native, 0x10020);
+ if (!native_classes[0] || !native_classes[1]) return -ENOENT;
+ if (native_classes[0] == native_classes[1]) return -EBADMSG;
+ list_for_each_entry(node, &tree->nodes, list) {
+  if (node->parent != tree->htb_parent || !node->native_class) continue;
+  if (node->native_class == native_classes[0]) i = 0;
+  else if (node->native_class == native_classes[1]) i = 1;
+  else return -E2BIG;
+  if (groups[i] || node->kind != QDX_SHAPER_HTB_GROUP ||
+      node->native != native || !node->linked)
+   return -EBADMSG;
+  groups[i] = node;
+ }
+ if (!groups[0] || !groups[1]) return -ENOENT;
+ required[0] = tree->root;
+ required[1] = tree->htb_parent;
+ required[2] = groups[0];
+ required[3] = groups[1];
+ if (!held) {
+  if (!class_ops->leaf) return -EOPNOTSUPP;
+  for (i = 0; i < ARRAY_SIZE(groups); i++) {
+   leaf = class_ops->leaf(native, native_classes[i]);
+   if (!leaf || strcmp(leaf->ops->id, "pfifo")) return -ENOENT;
+   list_for_each_entry(node, &tree->nodes, list) {
+    if (node->parent != groups[i]) continue;
+    if (required[4 + i] || node->native != leaf || node->native_class ||
+        node->kind != QDX_SHAPER_FIFO)
+     return -EBADMSG;
+    if (!node->linked) return -EINPROGRESS;
+    required[4 + i] = node;
+   }
+   if (!required[4 + i]) return -EINPROGRESS;
+  }
+  required_count = ARRAY_SIZE(required);
+ }
+ for (i = 0; i < required_count; i++) {
+  node = required[i];
+  if (node->tree != tree || node->retiring || node->native_dead ||
+      !node->allocated || !node->configured)
+   return -EBUSY;
+  for (operation = 0; operation < QDX_TC_NODE_OPERATIONS; operation++)
+   if (node->command[operation].request) return -EINPROGRESS;
+ }
+ if (!held) {
+  if (tree->held || tree->root_command.request || tree->default_command.request)
+   return -EINPROGRESS;
+  qdx_uses_lock();
+  spin_lock_bh(&owner->data_lock);
+  view = owner->available;
+  published = view && view->tree == tree && view->available && !view->invalid &&
+   (!owner->pending || owner->pending->invalid) &&
+   !READ_ONCE(owner->replay_needed) && !READ_ONCE(owner->closing);
+  spin_unlock_bh(&owner->data_lock);
+  qdx_uses_unlock();
+  if (!published) return -EAGAIN;
+ }
+ error = qdx_endpoint_ifnum(tree->endpoint, &ifnum);
+ if (error) return error;
+ return scnprintf(buffer, PAGE_SIZE,
+  "bf_full_identity held=%u shaper=%u ifnum=%u root_tag=%08x parent_tag=%08x group_a=%08x group_b=%08x\n",
+  held, owner->shaper, ifnum, tree->root->tag, tree->htb_parent->tag,
+  groups[0]->tag, groups[1]->tag);
+}
 
 static int qdx_tc_rate(struct qdx_shaper_rate *wire,
 		       const struct psched_ratecfg *rate, s64 ns,
@@ -125,6 +317,10 @@ static int qdx_tc_translate(struct net_device *dev, enum qdx_shaper_kind parent_
 
 		*native = offer->owner;
 		kind = QDX_SHAPER_FIFO;
+		if (diag_fairness && (parent_kind == QDX_SHAPER_HTB ||
+		    parent_kind == QDX_SHAPER_HTB_GROUP) &&
+		    (offer->byte_limit || offer->head_drop))
+			return -EOPNOTSUPP;
 		if (!offer->limit)
 			return -ERANGE;
 		if (offer->byte_limit) {
@@ -157,6 +353,13 @@ static int qdx_tc_translate(struct net_device *dev, enum qdx_shaper_kind parent_
 		*native = offer->owner;
 		if (!offer->explicit_offload)
 			return -EOPNOTSUPP;
+		if (diag_fairness && (diag_fairness > 3 || strcmp(dev->name, "lan2") ||
+		    offer->parent_class || (offer->owner.class &&
+		    (offer->effective_prio || offer->ratecfg.overhead ||
+		     (!diag_fair_unshaped &&
+		      offer->ceilcfg.rate_bytes_ps != diag_fair_rate_bytes_ps) ||
+		     offer->effective_quantum > S32_MAX - U16_MAX))))
+			return -EOPNOTSUPP;
 		if (!offer->owner.class) {
 			kind = QDX_SHAPER_HTB;
 			break;
@@ -174,6 +377,12 @@ static int qdx_tc_translate(struct net_device *dev, enum qdx_shaper_kind parent_
 				  offer->ceil_buffer_ns, 0, psched_mtu(dev), true);
 		if (err)
 			return err;
+		/* Preserve native rate/burst validation above. This is the table
+		 * chunk size, not the maximum admitted frame. M31 removes length
+		 * binning; integer clock conversion remains separately quantized.
+		 */
+		parameters.htb.rate.max_size = cpu_to_le32(31);
+		parameters.htb.ceil.max_size = cpu_to_le32(31);
 		parameters.htb.quantum = cpu_to_le32(offer->effective_quantum);
 		parameters.htb.priority = cpu_to_le32(offer->effective_prio);
 		parameters.htb.overhead = cpu_to_le32(offer->ratecfg.overhead);
@@ -582,6 +791,9 @@ static int qdx_tc_node_create(struct qdx_tc_node *node, bool intended_root)
 		message.command = cpu_to_le32(QDX_SHAPER_ALLOC);
 		message.data.allocate.kind = cpu_to_le32(node->kind);
 		message.data.allocate.tag = cpu_to_le32(node->tag);
+		err = qdx_tc_diag_fair_message(node, &message);
+		if (err)
+			return err;
 		err = qdx_tc_shaper_command(allocate, node->endpoint, &message);
 		if (err) {
 			if (owner->root_allocation == node && !allocate->request &&
@@ -637,8 +849,10 @@ static int qdx_tc_node_create(struct qdx_tc_node *node, bool intended_root)
 		return 0;
 	if (node->configured)
 		return 0;
-	if (node->kind == QDX_SHAPER_HTB || node->kind == QDX_SHAPER_PRIO) {
-		/* These nodes have topology, not a CHANGE_PARAM payload. */
+	if ((node->kind == QDX_SHAPER_HTB && !diag_fairness) ||
+	    node->kind == QDX_SHAPER_PRIO || qdx_tc_diag_fair_prio_root(node) ||
+	    (diag_fairness == 1 && node == node->tree->htb_parent)) {
+		/* These actual wire nodes have topology, not CHANGE_PARAM. */
 		node->configured = true;
 		return 0;
 	}
@@ -647,6 +861,9 @@ static int qdx_tc_node_create(struct qdx_tc_node *node, bool intended_root)
 		message.command = cpu_to_le32(QDX_SHAPER_CONFIG);
 		message.data.node.tag = cpu_to_le32(node->tag);
 		message.data.node.parameters = node->attempted;
+		err = qdx_tc_diag_fair_message(node, &message);
+		if (err)
+			return err;
 		err = qdx_tc_shaper_command(&node->command[QDX_TC_NODE_CONFIG],
 					     node->endpoint, &message);
 		if (err && node->command[QDX_TC_NODE_CONFIG].request)
@@ -659,6 +876,9 @@ static int qdx_tc_node_create(struct qdx_tc_node *node, bool intended_root)
 	message.command = cpu_to_le32(QDX_SHAPER_CONFIG);
 	message.data.node.tag = cpu_to_le32(node->tag);
 	message.data.node.parameters = node->parameters;
+	err = qdx_tc_diag_fair_message(node, &message);
+	if (err)
+		return err;
 	if (node->flows_memory)
 		qdx_dma_expose(node->flows_memory);
 	err = qdx_tc_shaper_command(&node->command[QDX_TC_NODE_CONFIG],
@@ -695,12 +915,13 @@ static int qdx_tc_node_link(struct qdx_tc_node *node, bool attach)
 		return -EINPROGRESS;
 	message.command = cpu_to_le32(attach ? QDX_SHAPER_ATTACH : QDX_SHAPER_DETACH);
 	message.data.node.tag = cpu_to_le32(parent->tag);
-	if (parent->kind == QDX_SHAPER_PRIO && !attach) {
+	if ((parent->kind == QDX_SHAPER_PRIO || qdx_tc_diag_fair_prio_root(parent)) &&
+	    !attach) {
 		/* PRIO DETACH names the actual band in the first payload word. */
 		message.data.node.parameters.attach.child = cpu_to_le32(node->band);
 	} else {
 		message.data.node.parameters.attach.child = cpu_to_le32(node->tag);
-		if (parent->kind == QDX_SHAPER_PRIO)
+		if (parent->kind == QDX_SHAPER_PRIO || qdx_tc_diag_fair_prio_root(parent))
 			message.data.node.parameters.attach.priority = cpu_to_le32(node->band);
 	}
 	err = qdx_tc_shaper_command(&node->command[operation], node->endpoint, &message);
@@ -1174,6 +1395,24 @@ static int qdx_tc_htb_create(struct qdx_tc_owner *owner,
 
 	if (qdx_tc_find_tree(owner, offer->owner.sch))
 		return -EEXIST;
+	if (diag_fair_unshaped && (diag_fairness != 2 && diag_fairness != 3))
+		return -EINVAL;
+	if (diag_fairness && (diag_fairness > 3 || owner->ifb_state ||
+	    owner->direction != QDX_TC_EGRESS || strcmp(owner->dev->name, "lan2")))
+		return -EINVAL;
+	if (diag_fairness && !diag_fair_unshaped &&
+	    (!diag_fair_rate_bytes_ps || diag_fair_burst_bytes < 31 ||
+	     diag_fair_burst_bytes > S32_MAX ||
+	     diag_fair_burst_bytes < DIV_ROUND_UP_ULL((u64)diag_fair_rate_bytes_ps, 1000)))
+		return -EINVAL;
+	if (diag_fair_unshaped)
+		netdev_warn(owner->dev,
+			"023 diagnostic fairness=%u: native HTB tags, different WRR law, PRIO band 0 root, no outer rate gate\n",
+			diag_fairness);
+	else if (diag_fairness)
+		netdev_warn(owner->dev,
+			"021 diagnostic fairness=%u: native HTB tags, different wire law, outer TBL %u B/s burst %u M31\n",
+			diag_fairness, diag_fair_rate_bytes_ps, diag_fair_burst_bytes);
 	tree = qdx_tc_tree_alloc(owner, offer->owner.sch);
 	if (IS_ERR(tree))
 		return PTR_ERR(tree);
@@ -1418,6 +1657,11 @@ static int qdx_tc_htb_modify(struct qdx_tc_node *node,
 	message.data.node.tag = cpu_to_le32(node->tag);
 	message.data.node.parameters = node->parameters;
 	node->attempted = node->parameters;
+	err = qdx_tc_diag_fair_message(node, &message);
+	if (err) {
+		node->parameters = old;
+		return err;
+	}
 	err = qdx_tc_shaper_command(&node->command[QDX_TC_NODE_CONFIG],
 				     node->endpoint, &message);
 	if (err) {
@@ -1464,6 +1708,10 @@ static int qdx_tc_node_reconcile(struct qdx_tc_node *node)
 			break;
 		case QDX_TC_NODE_ATTACH:
 		case QDX_TC_NODE_DETACH:
+			/* This request already owns its original edge bytes, including
+			 * a diagnostic PRIO band. shaper_command waits that request;
+			 * it does not submit this reconstruction while request exists.
+			 */
 			message.command = cpu_to_le32(operation == QDX_TC_NODE_ATTACH ?
 				QDX_SHAPER_ATTACH : QDX_SHAPER_DETACH);
 			message.data.node.tag = cpu_to_le32(node->parent->tag);
@@ -1473,6 +1721,9 @@ static int qdx_tc_node_reconcile(struct qdx_tc_node *node)
 			message.data.tag = cpu_to_le32(node->tag);
 			break;
 		}
+		err = qdx_tc_diag_fair_message(node, &message);
+		if (err)
+			return err;
 		err = qdx_tc_shaper_command(&node->command[operation], node->endpoint, &message);
 		if (node->command[operation].request)
 			return err ?: -EINPROGRESS;
@@ -1767,6 +2018,11 @@ int qdx_tc_htb_setup(struct qdx_tc_owner *owner,
 		offer->command == TC_HTB_LEAF_DEL_LAST || offer->command == TC_HTB_LEAF_DEL_LAST_FORCE;
 	if (!removing && !tc_can_offload(owner->dev))
 		return -EOPNOTSUPP;
+	if (diag_fairness && !removing && (offer->parent_class ||
+	    offer->command == TC_HTB_LEAF_TO_INNER)) {
+		NL_SET_ERR_MSG(offer->extack, "021 fairness diagnostic requires flat root classes");
+		return -EOPNOTSUPP;
+	}
 	if (offer->command == TC_HTB_CREATE && owner->dev->real_num_tx_queues != direct) {
 		NL_SET_ERR_MSG(offer->extack, "Existing or retiring class queues still own the active range");
 		return -EBUSY;
@@ -2279,6 +2535,12 @@ static int qdx_tc_collect_offer(enum tc_setup_type type, void *data, void *priva
 		entry->folded = true;
 		goto append;
 	}
+	if (diag_fairness && collect->parent &&
+	    collect->parent->parameters.kind == QDX_SHAPER_HTB_GROUP &&
+	    type != TC_SETUP_QDISC_FIFO) {
+		err = -EOPNOTSUPP;
+		goto fail;
+	}
 	err = qdx_tc_translate(collect->owner->dev,
 		collect->parent ? collect->parent->parameters.kind : 0,
 		type, data, true, &entry->parameters);
@@ -2718,6 +2980,12 @@ int qdx_tc_tree_prepare(struct qdx_tc_owner *owner, struct qdx_tc_view *view)
 				err = -ESTALE;
 				goto unlock;
 			}
+			/* Isolated 021 diagnostic: this queue hosts native PRIO.
+			 * Its successful dequeue stamps the final band queue; only
+			 * that actual storage leaf needs a firmware enqueue path.
+			 */
+			if (qdx_tc_deeper_prio(&collect, entry))
+				continue;
 		} else if (entry->parent && entry->parent->parameters.kind == QDX_SHAPER_PRIO &&
 			   !qdx_tc_deeper_prio(&collect, entry)) {
 			claim = (struct qdx_tc_queue_owner) {
@@ -3023,6 +3291,11 @@ int qdx_tc_qdisc_setup(struct qdx_tc_owner *owner, enum tc_setup_type type, void
 			err = -EAGAIN;
 			goto changed;
 		}
+	}
+	if (diag_fairness && parent_kind == QDX_SHAPER_HTB &&
+	    type != TC_SETUP_QDISC_FIFO) {
+		err = -EOPNOTSUPP;
+		goto changed;
 	}
 	if (owner->ifb_state) {
 		err = qdx_tc_ifb_prepare(owner);

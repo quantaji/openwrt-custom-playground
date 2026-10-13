@@ -52,7 +52,7 @@ $(eval $(call KernelPackage,qdx-bridge))
 define KernelPackage/qdx-vlan
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=Native VLAN path integration
-  DEPENDS:=@TARGET_qualcommax_ipq807x +kmod-qdx-drv
+  DEPENDS:=@TARGET_qualcommax_ipq807x +kmod-qdx-drv +kmod-qca-ppe
   KCONFIG:=CONFIG_QDX_VLAN
   FILES:=$(LINUX_DIR)/drivers/net/ethernet/qualcomm/qdx-vlan/qdx-vlan.ko
   AUTOLOAD:=$(call AutoProbe,qdx-vlan)
@@ -85,7 +85,7 @@ $(eval $(call KernelPackage,qca-edma))
 define KernelPackage/qca-ppe
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=Qualcomm IPQ807x 802.11ax PPE switch
-  DEPENDS:=@TARGET_qualcommax_ipq807x +kmod-libphy +PACKAGE_kmod-qdx-drv:kmod-qdx-drv
+  DEPENDS:=@TARGET_qualcommax_ipq807x +kmod-libphy +PACKAGE_kmod-qdx-drv:kmod-qdx-drv +kmod-qca-edma
   KCONFIG:=CONFIG_QCOM_80211AX_PPE
   FILES:=$(LINUX_DIR)/drivers/net/ethernet/qualcomm/qca_ppe.ko
   AUTOLOAD:=$(call AutoProbe,qca_ppe)

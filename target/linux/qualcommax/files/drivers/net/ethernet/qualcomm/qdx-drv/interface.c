@@ -343,6 +343,9 @@ struct qdx_endpoint *qdx_endpoint_alloc(struct qdx_service *service, u32 type)
 
 	supported = (service->kind == QDX_SERVICE_PPPOE && type == 8) ||
 		    (service->kind == QDX_SERVICE_VLAN && type == 17) ||
+		    /* Isolated probe: actual generic redirect pair for bounce. */
+		    (service->kind == QDX_SERVICE_SHAPER &&
+		     (type == 32 || type == 33)) ||
 		    (service->kind == QDX_SERVICE_IGS && type == 53) ||
 		    (service->kind == QDX_SERVICE_MATCH && type == 58) ||
 		    (service->kind == QDX_SERVICE_MIRROR && type == 65);

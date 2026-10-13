@@ -424,6 +424,101 @@ static struct qdx_tc_owner *qdx_tc_owner_find(struct net_device *dev,
 	return NULL;
 }
 
+/* Isolated diagnostic only. Hold asynchronous packet-path preparation while
+ * the empty, explicit LAN2 HTB graph is built by real native HTB commands.
+ * This is not a live class-conversion fix and never freezes admitted traffic.
+ */
+static bool diag_htb_prepare_hold;
+
+static int qdx_tc_diag_htb_hold_set(const char *value, const struct kernel_param *kp)
+{
+	struct qdx_tc_owner *owner;
+	struct net_device *dev;
+	struct Qdisc *root;
+	bool hold;
+	int err;
+
+	err = kstrtobool(value, &hold);
+	if (err)
+		return err;
+	rtnl_lock();
+	if (!READ_ONCE(qdx_tc_admitting)) {
+		err = -ESHUTDOWN;
+		goto out;
+	}
+	if (hold == diag_htb_prepare_hold)
+		goto out;
+	dev = __dev_get_by_name(&init_net, "lan2");
+	if (!dev) {
+		err = -ENODEV;
+		goto out;
+	}
+	owner = qdx_tc_owner_find(dev, QDX_TC_EGRESS);
+	if (hold) {
+		root = rtnl_dereference(dev->qdisc);
+		if (!owner || owner->closing || !owner->port || owner->ifb_state ||
+		    !owner->port_ops || !owner->port_ops->queues || !root ||
+		    (!(root->flags & TCQ_F_BUILTIN) &&
+		     (strcmp(root->ops->id, "noqueue") || root->enqueue ||
+		      root->handle || root->q.qlen || root->qstats.backlog))) {
+			err = -EBUSY;
+			goto out;
+		}
+		mutex_lock(&owner->cfg);
+		if (!list_empty(&owner->trees) || !list_empty(&owner->rules) ||
+		    owner->root_allocation)
+			err = -EBUSY;
+		mutex_unlock(&owner->cfg);
+		if (err)
+			goto out;
+	}
+	WRITE_ONCE(diag_htb_prepare_hold, hold);
+	if (owner && !owner->closing) {
+		WRITE_ONCE(owner->replay_needed, true);
+		qdx_tc_schedule(owner);
+	}
+ out:
+	rtnl_unlock();
+	return err;
+}
+
+static const struct kernel_param_ops qdx_tc_diag_htb_hold_ops = {
+	.set = qdx_tc_diag_htb_hold_set,
+	.get = param_get_bool,
+};
+module_param_cb(diag_htb_prepare_hold, &qdx_tc_diag_htb_hold_ops,
+		&diag_htb_prepare_hold, 0600);
+MODULE_PARM_DESC(diag_htb_prepare_hold,
+	"Diagnostic: hold empty LAN2 explicit HTB graph preparation; write 0 to replay");
+
+/* Read-only host observation: held mode reports synchronous identities;
+ * released mode additionally requires the completed published graph.
+ * Neither mode freezes the NSS scheduler or leases the graph for a caller. */
+static int qdx_tc_diag_bf_identity_get(char *buffer, const struct kernel_param *kp)
+{
+ struct qdx_tc_owner *owner;
+ struct net_device *dev;
+ int error;
+
+ rtnl_lock();
+ dev = __dev_get_by_name(&init_net, "lan2");
+ owner = dev ? qdx_tc_owner_find(dev, QDX_TC_EGRESS) : NULL;
+ if (!READ_ONCE(qdx_tc_admitting) || !owner) {
+  error = -ENODEV;
+ } else {
+  mutex_lock(&owner->cfg);
+  error = qdx_tc_diag_bf_identity(owner, READ_ONCE(diag_htb_prepare_hold), buffer);
+  mutex_unlock(&owner->cfg);
+ }
+ rtnl_unlock();
+ return error;
+}
+static const struct kernel_param_ops qdx_tc_diag_bf_identity_ops = {
+ .get = qdx_tc_diag_bf_identity_get,
+};
+module_param_cb(diag_bf_identity, &qdx_tc_diag_bf_identity_ops, NULL, 0400);
+MODULE_PARM_DESC(diag_bf_identity, "Read-only identity of the isolated Full BF two-class graph");
+
 static int qdx_tc_port_invalid(void *object, bool may_sleep)
 {
 	struct qdx_tc_owner *owner = object;
@@ -872,7 +967,7 @@ static void qdx_tc_owner_work(struct work_struct *work)
 	struct Qdisc *native_root;
 	unsigned int i;
 	bool prepare, changed, closing, permission, current_valid, release_igs;
-	bool conflict = false, publish = false;
+	bool conflict = false, publish = false, diag_hold = false;
 	int err = 0, result;
 
 	rtnl_lock();
@@ -910,6 +1005,19 @@ retire_state:
 			qdx_tc_view_put(view);
 	}
 	native_root = rtnl_dereference(owner->dev->qdisc);
+	diag_hold = READ_ONCE(diag_htb_prepare_hold) && permission &&
+		owner->direction == QDX_TC_EGRESS && net_eq(dev_net(owner->dev), &init_net) &&
+		!strcmp(owner->dev->name, "lan2") && native_root &&
+		!strcmp(native_root->ops->id, "htb");
+	if (diag_hold) {
+		mutex_lock(&owner->cfg);
+		diag_hold = owner->root_allocation &&
+			owner->root_allocation->native == native_root &&
+			owner->root_allocation->tree->explicit_htb;
+		mutex_unlock(&owner->cfg);
+	}
+	if (diag_hold)
+		prepare = false;
 	/* Even an unlinked prospective root occupies the firmware dequeue root
 	 * from its first ALLOC. Native replacement must end that actual root;
 	 * a SET_ROOT on another already allocated node cannot replace it.
@@ -923,7 +1031,13 @@ retire_state:
 			tree->native_dead = true;
 		if (closing)
 			tree->native_dead = true;
+		/* Only the diagnostic's current explicit graph may await preparation
+		 * without a view. Real destruction, failed operations and old roots
+		 * still use their original retirement paths below.
+		 */
 		if (!permission || tree->native_dead || (!tree->prospective &&
+		    !(diag_hold && tree->explicit_htb && tree->root &&
+		      tree->root->native == native_root) &&
 		    (!owner->available || owner->available->invalid) &&
 		    (!owner->pending || owner->pending->invalid || owner->pending->tree != tree)))
 			tree->retiring = true;
@@ -1160,7 +1274,10 @@ owner_pending:
 	 * invocation's retirement. Local puts deliberately do not requeue work;
 	 * preserve this actual event without polling unresolved resource holds.
 	 */
-	if (permission && !conflict && READ_ONCE(owner->replay_needed)) {
+	/* Keep the actual replay request pending without polling this diagnostic
+	 * hold. Its explicit release schedules the normal current native walk.
+	 */
+	if (permission && !conflict && !diag_hold && READ_ONCE(owner->replay_needed)) {
 		qdx_tc_owner_get(owner);
 		if (mod_delayed_work(qdx_tc_wq, &owner->work, 0))
 			qdx_tc_owner_put(owner);

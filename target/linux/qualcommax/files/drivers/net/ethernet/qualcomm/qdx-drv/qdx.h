@@ -244,7 +244,16 @@ struct qdx_limits {
 	unsigned long peer_dma_bytes;
 };
 
+/* Diagnostic budget reservations, not physical allocator occupancy. */
+struct qdx_resource_observer {
+	spinlock_t lock;
+	bool enabled, active;
+	u64 epoch, begin_ns, end_ns;
+	long seed[3], peak[3], ended[3];
+};
+
 struct qdx {
+	struct qdx_resource_observer resource_observer;
 	struct device *dev;
 	struct platform_device *pdev;
 	struct qdx_hw *hw;

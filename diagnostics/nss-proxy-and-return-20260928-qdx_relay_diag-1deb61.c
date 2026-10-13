@@ -1,0 +1,448 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Isolated 114368 diagnostic: physical LAN3/if3 -> LAN2/if4 raw NSS relay.
+ * Root must stop traffic and verify the documented empty/default fixture first.
+ * These historical APIs are a diagnostic carrier, not a Phase 2.5 API proposal.
+ */
+#include <linux/debugfs.h>
+#include <linux/err.h>
+#include <linux/jiffies.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/netdevice.h>
+#include <linux/qdx.h>
+#include <linux/refcount.h>
+#include <linux/seq_file.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/string.h>
+#include <linux/uaccess.h>
+#include <net/net_namespace.h>
+
+#define RELAY_SOURCE_NAME "lan3"
+#define RELAY_TARGET_NAME "lan2"
+#define RELAY_SOURCE_IFNUM 3
+#define RELAY_TARGET_IFNUM 4
+#define RELAY_SET_NEXTHOP 15
+#define RELAY_RESET_NEXTHOP 18
+#define RELAY_WAIT_MS 3000
+
+static bool allow_writes;
+module_param(allow_writes, bool, 0400);
+MODULE_PARM_DESC(allow_writes, "Enable fixed diagnostic commands; default false");
+
+static DEFINE_MUTEX(relay_lock);
+struct relay_reply {
+	refcount_t refs;
+	spinlock_t lock;
+	struct qdx_result result;
+	unsigned int deliveries;
+};
+static struct relay_reply *pending_reply;
+static struct dentry *relay_debugfs;
+static struct net_device *source_dev, *target_dev;
+static struct qdx_service *relay_service;
+static struct qdx_endpoint *source_endpoint, *target_endpoint;
+static struct qdx_rx_use *source_rx, *resume_rx;
+static struct qdx_request *pending_request;
+static struct qdx_result last_result;
+static u32 pending_opcode;
+static bool self_pinned, attached, held, running;
+static unsigned int result_deliveries;
+static int last_error;
+
+/* Each request has its own callback storage. A final callback from an older
+ * request cannot write a later command's result, even after its waiter settles.
+ */
+static bool relay_reply_get(void *owner)
+{
+	struct relay_reply *reply = owner;
+
+	return refcount_inc_not_zero(&reply->refs);
+}
+
+static void relay_reply_put(void *owner)
+{
+	struct relay_reply *reply = owner;
+
+	if (refcount_dec_and_test(&reply->refs))
+		kfree(reply);
+}
+
+/* NAPI-safe; never takes relay_lock, including while the command waits. */
+static void relay_result(void *owner, const struct qdx_result *result,
+                         const void *payload, size_t length)
+{
+	struct relay_reply *reply = owner;
+	unsigned long flags;
+
+	spin_lock_irqsave(&reply->lock, flags);
+	reply->result = *result;
+	reply->deliveries++;
+	spin_unlock_irqrestore(&reply->lock, flags);
+}
+
+/* Only settled commands can be consumed. UNKNOWN remains the original object. */
+static int relay_command(u32 opcode, bool submit, unsigned long wait_ms)
+{
+	struct qdx_command_recipient recipient = {
+		.owner = { .module = THIS_MODULE, .get = relay_reply_get,
+			.put = relay_reply_put },
+		.result = relay_result,
+	};
+	struct qdx_reply_bounds bounds = {
+		.minimum = 0,
+		.maximum = opcode == RELAY_SET_NEXTHOP ? sizeof(__le32) : 0,
+		.capacity = sizeof(__le32),
+	};
+	struct qdx_result result;
+	struct qdx_request *request;
+	struct relay_reply *reply;
+	__le32 target = cpu_to_le32(RELAY_TARGET_IFNUM);
+	unsigned long flags;
+	int error;
+
+	if (pending_request && pending_opcode != opcode)
+		return -EBUSY;
+	if (!pending_request) {
+		if (!submit)
+			return 0;
+		reply = kzalloc(sizeof(*reply), GFP_KERNEL);
+		if (!reply)
+			return -ENOMEM;
+		refcount_set(&reply->refs, 1);
+		spin_lock_init(&reply->lock);
+		reply->result = (struct qdx_result) {
+			.ifnum = RELAY_SOURCE_IFNUM, .opcode = opcode,
+			.outcome = QDX_UNKNOWN, .error = -EINPROGRESS,
+		};
+		last_result = reply->result;
+		result_deliveries = 0;
+		recipient.owner.object = reply;
+		request = qdx_command_submit(source_endpoint, opcode,
+			opcode == RELAY_SET_NEXTHOP ? &target : NULL,
+			opcode == RELAY_SET_NEXTHOP ? sizeof(target) : 0,
+			&bounds, &recipient);
+		if (IS_ERR(request)) {
+			error = PTR_ERR(request);
+			last_result.outcome = QDX_NOT_SUBMITTED;
+			last_result.error = error;
+			relay_reply_put(reply);
+			return error;
+		}
+		pending_reply = reply;
+		pending_request = request;
+		pending_opcode = opcode;
+	}
+	error = qdx_request_wait(pending_request,
+		jiffies + msecs_to_jiffies(wait_ms), &result, NULL, 0);
+	/* The callback may publish a newer final reply just after wait returns.
+	 * Never replace its final outcome with this waiter's older UNKNOWN copy.
+	 */
+	reply = pending_reply;
+	spin_lock_irqsave(&reply->lock, flags);
+	if (reply->result.outcome == QDX_UNKNOWN ||
+	    result.outcome != QDX_UNKNOWN || result.exposure_ended)
+		reply->result = result;
+	result = reply->result;
+	last_result = result;
+	result_deliveries = reply->deliveries;
+	spin_unlock_irqrestore(&reply->lock, flags);
+	if (result.outcome == QDX_UNKNOWN && !result.exposure_ended)
+		return error ?: result.error ?: -EINPROGRESS;
+	qdx_request_put(pending_request);
+	pending_request = NULL;
+	pending_reply = NULL;
+	relay_reply_put(reply);
+	pending_opcode = 0;
+	if (result.outcome == QDX_ACK) {
+		attached = opcode == RELAY_SET_NEXTHOP;
+		return 0;
+	}
+	if (qdx_service_access_ended(relay_service))
+		attached = false;
+	return result.error ?: error ?: -EIO;
+}
+
+/* No packet storage or physical firmware endpoint is destroyed here. */
+static void relay_put_refs(void)
+{
+	qdx_endpoint_put(target_endpoint);
+	target_endpoint = NULL;
+	qdx_endpoint_put(source_endpoint);
+	source_endpoint = NULL;
+	qdx_service_put(relay_service);
+	relay_service = NULL;
+	if (target_dev)
+		dev_put(target_dev);
+	target_dev = NULL;
+	if (source_dev)
+		dev_put(source_dev);
+	source_dev = NULL;
+	if (self_pinned) {
+		self_pinned = false;
+		module_put(THIS_MODULE);
+	}
+}
+
+static int relay_prepare(void)
+{
+	u32 source, target;
+	int error;
+
+	if (attached || running || resume_rx)
+		return -EBUSY;
+	if (pending_request)
+		return pending_opcode == RELAY_SET_NEXTHOP ?
+			relay_command(RELAY_SET_NEXTHOP, false, RELAY_WAIT_MS) : -EBUSY;
+	if (source_rx)
+		return held ? relay_command(RELAY_SET_NEXTHOP, true, RELAY_WAIT_MS) : -EBUSY;
+	if (!try_module_get(THIS_MODULE))
+		return -ENODEV;
+	self_pinned = true;
+	source_dev = dev_get_by_name(&init_net, RELAY_SOURCE_NAME);
+	target_dev = dev_get_by_name(&init_net, RELAY_TARGET_NAME);
+	if (!source_dev || !target_dev || source_dev == target_dev) {
+		error = -ENODEV;
+		goto put_refs;
+	}
+	if (!netif_running(source_dev) || !netif_running(target_dev) ||
+	    !netif_carrier_ok(source_dev) || !netif_carrier_ok(target_dev)) {
+		error = -ENETDOWN;
+		goto put_refs;
+	}
+	relay_service = qdx_service_get(source_dev, QDX_SERVICE_ETHERNET);
+	if (IS_ERR(relay_service)) {
+		error = PTR_ERR(relay_service);
+		relay_service = NULL;
+		goto put_refs;
+	}
+	source_endpoint = qdx_endpoint_get(relay_service, source_dev);
+	if (IS_ERR(source_endpoint)) {
+		error = PTR_ERR(source_endpoint);
+		source_endpoint = NULL;
+		goto put_refs;
+	}
+	target_endpoint = qdx_endpoint_get(relay_service, target_dev);
+	if (IS_ERR(target_endpoint)) {
+		error = PTR_ERR(target_endpoint);
+		target_endpoint = NULL;
+		goto put_refs;
+	}
+	error = qdx_endpoint_ifnum(source_endpoint, &source);
+	if (!error)
+		error = qdx_endpoint_ifnum(target_endpoint, &target);
+	if (error)
+		goto put_refs;
+	if (source != RELAY_SOURCE_IFNUM || target != RELAY_TARGET_IFNUM ||
+	    source == target) {
+		error = -EXDEV;
+		goto put_refs;
+	}
+	source_rx = qdx_rx_acquire(source_endpoint, source_dev);
+	if (IS_ERR(source_rx)) {
+		error = PTR_ERR(source_rx);
+		source_rx = NULL;
+		goto put_refs;
+	}
+	/* acquire initially enables the native RX reservation. No fixture traffic
+	 * is allowed until arm. The old default receive path exists in this gap.
+	 */
+	error = qdx_rx_hold(source_rx);
+	if (error)
+		return error; /* retain the exact reservation for explicit restore */
+	held = true;
+	return relay_command(RELAY_SET_NEXTHOP, true, RELAY_WAIT_MS);
+put_refs:
+	relay_put_refs();
+	return error;
+}
+
+static int relay_arm(void)
+{
+	int error;
+
+	if (!source_rx || !held || !attached || pending_request || running)
+		return -EINVAL;
+	if (qdx_service_state(relay_service) != QDX_AVAILABLE ||
+	    !netif_running(source_dev) || !netif_running(target_dev) ||
+	    !netif_carrier_ok(source_dev) || !netif_carrier_ok(target_dev))
+		return -ENETDOWN;
+	if (!resume_rx) {
+		resume_rx = qdx_rx_acquire(source_endpoint, source_dev);
+		if (IS_ERR(resume_rx)) {
+			error = PTR_ERR(resume_rx);
+			resume_rx = NULL;
+			return error;
+		}
+	}
+	error = qdx_rx_release(source_rx);
+	if (error)
+		return error; /* both exact handles remain retained */
+	source_rx = resume_rx;
+	resume_rx = NULL;
+	held = false;
+	running = true;
+	return 0;
+}
+
+static int relay_stop(void)
+{
+	int error;
+
+	if (!source_rx)
+		return 0;
+	error = qdx_rx_hold(source_rx);
+	if (!error) {
+		held = true;
+		running = false;
+	}
+	return error;
+}
+
+static int relay_restore(void)
+{
+	int error;
+
+	if (!self_pinned)
+		return 0;
+	error = relay_stop();
+	if (error)
+		return error;
+	if (pending_request) {
+		error = relay_command(pending_opcode, false, RELAY_WAIT_MS);
+		if (pending_request)
+			return error; /* no inverse command after UNKNOWN */
+		/* A settled rejected SET changed nothing. A rejected RESET below
+		 * leaves attached true and can be explicitly retried by restore.
+		 */
+	}
+	if (qdx_service_access_ended(relay_service))
+		attached = false;
+	if (attached) {
+		error = relay_command(RELAY_RESET_NEXTHOP, true, RELAY_WAIT_MS);
+		if (error)
+			return error;
+	}
+	if (resume_rx) {
+		error = qdx_rx_release(resume_rx);
+		if (error)
+			return error;
+		resume_rx = NULL;
+	}
+	if (source_rx) {
+		error = qdx_rx_release(source_rx);
+		if (error)
+			return error;
+		source_rx = NULL;
+	}
+	held = false;
+	running = false;
+	relay_put_refs();
+	return 0;
+}
+
+static int relay_status_show(struct seq_file *seq, void *unused)
+{
+	struct qdx_result result;
+	unsigned long flags;
+	unsigned int deliveries;
+
+	mutex_lock(&relay_lock);
+	result = last_result;
+	deliveries = result_deliveries;
+	if (pending_reply) {
+		spin_lock_irqsave(&pending_reply->lock, flags);
+		result = pending_reply->result;
+		deliveries = pending_reply->deliveries;
+		spin_unlock_irqrestore(&pending_reply->lock, flags);
+	}
+	seq_printf(seq, "source=%s source_ifnum=%u target=%s target_ifnum=%u\n",
+		RELAY_SOURCE_NAME, RELAY_SOURCE_IFNUM,
+		RELAY_TARGET_NAME, RELAY_TARGET_IFNUM);
+	seq_printf(seq, "allow_writes=%u pinned=%u source_rx=%u resume_rx=%u held=%u attached=%u running=%u\n",
+		allow_writes, self_pinned, !!source_rx, !!resume_rx,
+		held, attached, running);
+	seq_printf(seq, "service_state=%d access_ended=%u pending=%u pending_opcode=%u last_error=%d\n",
+		relay_service ? (int)qdx_service_state(relay_service) : -1,
+		relay_service ? qdx_service_access_ended(relay_service) : false,
+		!!pending_request, pending_opcode, last_error);
+	seq_printf(seq, "id=%llu opcode=%u ifnum=%u outcome=%u error=%d firmware_error=%u published=%u exposure_ended=%u received=%zu declared=%zu deliveries=%u\n",
+		(unsigned long long)result.id, result.opcode, result.ifnum,
+		result.outcome, result.error, result.firmware_error,
+		result.published, result.exposure_ended, result.received_len,
+		result.declared_len, deliveries);
+	mutex_unlock(&relay_lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(relay_status);
+
+static ssize_t relay_control_write(struct file *file, const char __user *buffer,
+                                  size_t count, loff_t *position)
+{
+	char command[24];
+	int error;
+
+	if (!allow_writes)
+		return -EPERM;
+	if (!count || count >= sizeof(command))
+		return -EINVAL;
+	if (copy_from_user(command, buffer, count))
+		return -EFAULT;
+	command[count] = '\0';
+	strim(command);
+	mutex_lock(&relay_lock);
+	if (!strcmp(command, "prepare"))
+		error = relay_prepare();
+	else if (!strcmp(command, "arm"))
+		error = relay_arm();
+	else if (!strcmp(command, "stop"))
+		error = relay_stop();
+	else if (!strcmp(command, "restore"))
+		error = relay_restore();
+	else if (!strcmp(command, "poll"))
+		error = pending_request ? relay_command(pending_opcode, false, 0) : 0;
+	else
+		error = -EINVAL;
+	last_error = error;
+	mutex_unlock(&relay_lock);
+	return error ?: count;
+}
+
+static const struct file_operations relay_control_fops = {
+	.owner = THIS_MODULE,
+	.write = relay_control_write,
+};
+
+static int __init relay_init(void)
+{
+	struct dentry *entry;
+
+	relay_debugfs = debugfs_create_dir("qdx_relay_diag", NULL);
+	if (IS_ERR_OR_NULL(relay_debugfs))
+		return relay_debugfs ? PTR_ERR(relay_debugfs) : -ENOMEM;
+	entry = debugfs_create_file("control", 0200, relay_debugfs, NULL,
+		&relay_control_fops);
+	if (IS_ERR_OR_NULL(entry))
+		goto fail;
+	entry = debugfs_create_file("status", 0400, relay_debugfs, NULL,
+		&relay_status_fops);
+	if (IS_ERR_OR_NULL(entry))
+		goto fail;
+	return 0;
+fail:
+	debugfs_remove_recursive(relay_debugfs);
+	return entry ? PTR_ERR(entry) : -ENOMEM;
+}
+
+static void __exit relay_exit(void)
+{
+	/* Normal unload is refused by explicit and command-recipient references
+	 * while resources or an unknown result survive. No timed cleanup here.
+	 */
+	WARN_ON(self_pinned || pending_request || pending_reply || source_rx || resume_rx || attached);
+	debugfs_remove_recursive(relay_debugfs);
+}
+module_init(relay_init);
+module_exit(relay_exit);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Isolated fixed physical NSS relay diagnostic for QDX 114368");

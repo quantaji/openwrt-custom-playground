@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Instance lifetime, dual-core startup, and terminal handback coordination. */
 #include <linux/delay.h>
+#include <linux/ktime.h>
 #include <linux/limits.h>
 #include <linux/module.h>
 #include <linux/srcu.h>
@@ -13,6 +14,10 @@
 
 /* This module is resident: no ordinary exit can recreate the boot latch. */
 static atomic_t qdx_boot_attempted = ATOMIC_INIT(0);
+
+static bool diag_resources;
+module_param(diag_resources, bool, 0400);
+MODULE_PARM_DESC(diag_resources, "Boot-only reservation peak observer; separate resource run");
 
 /* Resource choices are fixed before either firmware core can execute. */
 static unsigned int native_rx_entries = 2048;
@@ -31,7 +36,8 @@ static unsigned long rx_memory_limit_mib = 256;
 module_param(rx_memory_limit_mib, ulong, 0444);
 MODULE_PARM_DESC(rx_memory_limit_mib, "QDX-owned RX allocation charge limit in MiB");
 
-static unsigned long host_data_limit_mib = 8;
+/* Isolated512-item host-input diagnostic; allocation ceiling, not a preallocation. */
+static unsigned long host_data_limit_mib = 64;
 module_param(host_data_limit_mib, ulong, 0444);
 MODULE_PARM_DESC(host_data_limit_mib, "Accepted host packet allocation limit in MiB");
 
@@ -419,13 +425,15 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attribute
 	return sysfs_emit(buffer,
 		"%s error=%d attempted=%d execution_possible=%u access_ended=%u "
 		"native_rx_entries=%u tx_slots=%u rx_dma_limit_bytes=%lu rx_memory_limit_bytes=%lu "
-		"rx_dma_used_bytes=%ld rx_memory_charged_bytes=%ld\n",
+		"rx_dma_used_bytes=%ld rx_memory_charged_bytes=%ld "
+		"host_data_limit_bytes=%lu host_data_used_bytes=%ld\n",
 		names[state], atomic_read(&qdx->failure), atomic_read(&qdx_boot_attempted),
 		READ_ONCE(qdx->execution_possible), READ_ONCE(qdx->access_ended),
 		qdx->limits.native_rx_entries, qdx->limits.tx_slots,
 		qdx->limits.rx_dma_bytes, qdx->limits.rx_memory_bytes,
 		atomic_long_read(&qdx->rx_dma_used),
-		atomic_long_read(&qdx->rx_memory_charged));
+		atomic_long_read(&qdx->rx_memory_charged), qdx->limits.host_data_bytes,
+		atomic_long_read(&qdx->host_data_used));
 }
 static DEVICE_ATTR_RO(state);
 
@@ -444,7 +452,82 @@ static ssize_t cores_show(struct device *dev, struct device_attribute *attribute
 }
 static DEVICE_ATTR_RO(cores);
 
+/* Only observer bookkeeping changes. Begin/end never reset a live budget. */
+static ssize_t resource_observer_store(struct device *dev,
+				      struct device_attribute *attribute,
+				      const char *buffer, size_t count)
+{
+	struct qdx *qdx = dev_get_drvdata(dev);
+	struct qdx_resource_observer *observer = &qdx->resource_observer;
+	unsigned long flags;
+	long values[3];
+	bool begin;
+	int error = 0;
+
+	if (!observer->enabled)
+		return -EOPNOTSUPP;
+	if (sysfs_streq(buffer, "begin"))
+		begin = true;
+	else if (sysfs_streq(buffer, "end"))
+		begin = false;
+	else
+		return -EINVAL;
+	spin_lock_irqsave(&observer->lock, flags);
+	if (begin && observer->active) {
+		error = -EBUSY;
+		goto out;
+	}
+	if (!begin && !observer->active) {
+		error = -EINVAL;
+		goto out;
+	}
+	values[0] = atomic_long_read(&qdx->host_data_used);
+	values[1] = atomic_long_read(&qdx->rx_dma_used);
+	values[2] = atomic_long_read(&qdx->rx_memory_charged);
+	if (begin) {
+		memcpy(observer->seed, values, sizeof(values));
+		memcpy(observer->peak, values, sizeof(values));
+		memset(observer->ended, 0, sizeof(observer->ended));
+		observer->epoch++;
+		observer->begin_ns = ktime_get_ns();
+		observer->end_ns = 0;
+		observer->active = true;
+	} else {
+		observer->active = false;
+		observer->end_ns = ktime_get_ns();
+		memcpy(observer->ended, values, sizeof(values));
+	}
+out:
+	spin_unlock_irqrestore(&observer->lock, flags);
+	return error ? error : count;
+}
+
+static ssize_t resource_observer_show(struct device *dev,
+				     struct device_attribute *attribute, char *buffer)
+{
+	struct qdx *qdx = dev_get_drvdata(dev);
+	struct qdx_resource_observer *observer = &qdx->resource_observer;
+	unsigned long flags;
+	ssize_t length;
+
+	spin_lock_irqsave(&observer->lock, flags);
+	length = sysfs_emit(buffer,
+		"enabled=%u active=%u epoch=%llu begin_ns=%llu end_ns=%llu diagnostic_bytes=%zu driver_private_bytes=%zu\n"
+		"budget=host_data_used_bytes seed=%ld live=%ld peak=%ld ended=%ld\n"
+		"budget=rx_dma_used_bytes seed=%ld live=%ld peak=%ld ended=%ld\n"
+		"budget=rx_memory_charged_bytes seed=%ld live=%ld peak=%ld ended=%ld\n",
+		observer->enabled, observer->active, observer->epoch,
+		observer->begin_ns, observer->end_ns, sizeof(*observer), sizeof(*qdx),
+		observer->seed[0], atomic_long_read(&qdx->host_data_used), observer->peak[0], observer->ended[0],
+		observer->seed[1], atomic_long_read(&qdx->rx_dma_used), observer->peak[1], observer->ended[1],
+		observer->seed[2], atomic_long_read(&qdx->rx_memory_charged), observer->peak[2], observer->ended[2]);
+	spin_unlock_irqrestore(&observer->lock, flags);
+	return length;
+}
+static DEVICE_ATTR_RW(resource_observer);
+
 static struct attribute *qdx_attributes[] = {
+	&dev_attr_resource_observer.attr,
 	&dev_attr_state.attr,
 	&dev_attr_cores.attr,
 	NULL,
@@ -479,6 +562,8 @@ void qdx_services_init(struct qdx *qdx)
 	};
 	unsigned int i;
 
+	spin_lock_init(&qdx->resource_observer.lock);
+	qdx->resource_observer.enabled = diag_resources;
 	atomic_set(&qdx->service_users, 0);
 	atomic_long_set(&qdx->host_data_used, 0);
 	atomic_long_set(&qdx->peer_dma_used, 0);

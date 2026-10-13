@@ -388,17 +388,27 @@ struct qdx_dma {
 	enum dma_data_direction direction;
 	bool exposed;
 	bool release_pending;
+	/* Isolated two-bin diagnostic: retained through each borrowed copy. */
+	struct qdx_owner diag_owner;
+	atomic_t diag_borrowers;
+	u32 diag_fq_node;
+ u64 diag_exposure, diag_bf_exposure;
+ u32 diag_bf_key[7];
+ bool diag_bf_pinned;
 };
 
 static void qdx_dma_free(struct qdx_dma *region)
 {
 	struct qdx_service *service = region->service;
+	struct qdx_owner diag_owner = region->diag_owner;
 
 	dma_free_coherent(service->qdx->dev, region->allocation, region->base,
 			  region->base_dma);
 	atomic_long_sub(region->allocation, &service->qdx->peer_dma_used);
 	kfree(region);
 	qdx_service_put(service);
+	if (diag_owner.module)
+		qdx_owner_put(&diag_owner);
 }
 
 struct qdx_dma *qdx_dma_alloc(struct qdx_service *service, size_t length,
@@ -474,6 +484,8 @@ EXPORT_SYMBOL_GPL(qdx_dma_address);
 
 void qdx_dma_expose(struct qdx_dma *region)
 {
+ region->diag_exposure++;
+ region->diag_bf_pinned = false;
 	WRITE_ONCE(region->exposed, true);
 }
 EXPORT_SYMBOL_GPL(qdx_dma_expose);
@@ -481,6 +493,8 @@ EXPORT_SYMBOL_GPL(qdx_dma_expose);
 void qdx_dma_access_end(struct qdx_dma *region)
 {
 	WRITE_ONCE(region->exposed, false);
+	WRITE_ONCE(region->diag_fq_node, 0);
+ region->diag_bf_pinned = false;
 }
 EXPORT_SYMBOL_GPL(qdx_dma_access_end);
 
@@ -493,7 +507,8 @@ void qdx_dma_release(struct qdx_dma *region)
 		return;
 	qdx = region->service->qdx;
 	mutex_lock(&qdx->region_lock);
-	release = !READ_ONCE(region->exposed) || smp_load_acquire(&qdx->access_ended);
+	release = (!READ_ONCE(region->exposed) || smp_load_acquire(&qdx->access_ended)) &&
+		  !atomic_read(&region->diag_borrowers);
 	if (release)
 		list_del(&region->node);
 	else
@@ -512,7 +527,7 @@ void qdx_dma_end_all(struct qdx *qdx)
 	mutex_lock(&qdx->region_lock);
 	list_for_each_entry_safe(region, next, &qdx->regions, node) {
 		WRITE_ONCE(region->exposed, false);
-		if (region->release_pending)
+		if (region->release_pending && !atomic_read(&region->diag_borrowers))
 			list_move_tail(&region->node, &release);
 	}
 	mutex_unlock(&qdx->region_lock);
@@ -524,3 +539,155 @@ void qdx_dma_end_all(struct qdx *qdx)
 
 MODULE_FIRMWARE("qdx/11.4/retail_router0.bin");
 MODULE_FIRMWARE("qdx/11.4/retail_router1.bin");
+
+/* Private isolated diagnostic symbols, intentionally absent from linux/qdx.h.
+ * There is no raw-address, offset or length input. Allocation creates the
+ * only allowed whole144-byte object before firmware sees its address.
+ */
+struct qdx_dma *qdx_diag_fq_table_alloc(struct qdx_service *service,
+                                      const struct qdx_owner *owner);
+int qdx_diag_fq_table_get(struct qdx_service *mirror, struct qdx_dma *handle,
+                         const struct qdx_owner *owner, dma_addr_t *address);
+void qdx_diag_fq_table_put(struct qdx_dma *region);
+bool qdx_diag_fq_table_idle(struct qdx_dma *region);
+bool qdx_diag_fq_table_matches(struct qdx_dma *region, const u8 expected[144]);
+u32 qdx_diag_fq_table_node(struct qdx_dma *region, u32 derived);
+bool qdx_diag_fq_table_physical(struct qdx_dma *region);
+bool qdx_diag_fq_table_bf(struct qdx_dma *region, const u32 key[7], bool record);
+
+struct qdx_dma *qdx_diag_fq_table_alloc(struct qdx_service *service,
+                                      const struct qdx_owner *owner)
+{
+	struct qdx_dma *region;
+
+	if (!service || (service->kind != QDX_SERVICE_IGS &&
+	    service->kind != QDX_SERVICE_SHAPER) || !owner ||
+	    !owner->module || !owner->object || owner->get || owner->put ||
+	    (strcmp(module_name(owner->module), "qdx_mirror_state_diag") &&
+	     strcmp(module_name(owner->module), "qdx_wrr_handover_diag") &&
+	     strcmp(module_name(owner->module), "qdx_rate_handover_diag") &&
+	     strcmp(module_name(owner->module), "qdx_aqm_handover_diag") &&
+	     strcmp(module_name(owner->module), "qdx_physical_aqm_diag") &&
+	     strcmp(module_name(owner->module), "qdx_physical_rate_diag") &&
+	     strcmp(module_name(owner->module), "qdx_physical_wrr_diag") &&
+	     strcmp(module_name(owner->module), "qdx_physical_fq_diag")))
+		return ERR_PTR(-EPERM);
+	if ((!strcmp(module_name(owner->module), "qdx_rate_handover_diag") ||
+	     !strcmp(module_name(owner->module), "qdx_aqm_handover_diag")) &&
+	    service->kind != QDX_SERVICE_IGS)
+		return ERR_PTR(-EPERM);
+	if ((!strcmp(module_name(owner->module), "qdx_physical_aqm_diag") ||
+	     !strcmp(module_name(owner->module), "qdx_physical_fq_diag") ||
+	     !strcmp(module_name(owner->module), "qdx_physical_rate_diag") ||
+	     !strcmp(module_name(owner->module), "qdx_physical_wrr_diag")) &&
+	    service->kind != QDX_SERVICE_SHAPER)
+		return ERR_PTR(-EPERM);
+	if (!qdx_owner_get(owner))
+		return ERR_PTR(-ESHUTDOWN);
+	region = qdx_dma_alloc(service, 144, 64, DMA_BIDIRECTIONAL);
+	if (IS_ERR(region)) {
+		qdx_owner_put(owner);
+		return region;
+	}
+	region->diag_owner = *owner;
+	atomic_set(&region->diag_borrowers, 0);
+	return region;
+}
+EXPORT_SYMBOL_GPL(qdx_diag_fq_table_alloc);
+
+int qdx_diag_fq_table_get(struct qdx_service *mirror, struct qdx_dma *handle,
+                         const struct qdx_owner *owner, dma_addr_t *address)
+{
+	struct qdx_dma *region;
+	int error = -ENOENT;
+
+	if (!mirror || mirror->kind != QDX_SERVICE_MIRROR || !owner)
+		return -EINVAL;
+	/* Compare handles first: never dereference a supplied unregistered one. */
+	mutex_lock(&mirror->qdx->region_lock);
+	list_for_each_entry(region, &mirror->qdx->regions, node) {
+		if (region != handle)
+			continue;
+		error = -EPERM;
+		if (!region->diag_owner.module ||
+		    region->diag_owner.module != owner->module ||
+		    region->diag_owner.object != owner->object ||
+		    owner->get || owner->put ||
+		    (region->service->kind != QDX_SERVICE_IGS &&
+		     region->service->kind != QDX_SERVICE_SHAPER) ||
+		    region->service->core != mirror->core ||
+		    region->service->qdx != mirror->qdx ||
+		    region->length != 144 || region->direction != DMA_BIDIRECTIONAL ||
+		    !READ_ONCE(region->exposed) || region->release_pending ||
+		    qdx_service_state(region->service) != QDX_AVAILABLE)
+			break;
+		error = -EBUSY;
+		if (atomic_cmpxchg(&region->diag_borrowers, 0, 1))
+			break;
+		*address = region->dma;
+		error = 0;
+		break;
+	}
+	mutex_unlock(&mirror->qdx->region_lock);
+	return error;
+}
+
+void qdx_diag_fq_table_put(struct qdx_dma *region)
+{
+	/* NAPI-safe. The exposed table retains its own allocation/module owner.
+	 * An erroneous early release is quarantined, never freed in NAPI.
+	 * The diagnostic joins returns before its explicit process-context release.
+	 */
+	WARN_ON_ONCE(atomic_dec_return(&region->diag_borrowers) != 0);
+}
+
+bool qdx_diag_fq_table_idle(struct qdx_dma *region)
+{
+	return !atomic_read(&region->diag_borrowers);
+}
+EXPORT_SYMBOL_GPL(qdx_diag_fq_table_idle);
+
+/* Caller already owns the single registered borrow. The completed source copy
+ * released this coherent table; compare the actual allocation, not a handle.
+ */
+bool qdx_diag_fq_table_matches(struct qdx_dma *region, const u8 expected[144])
+{
+ dma_rmb();
+ return !memcmp(region->cpu, expected, 144);
+}
+
+/* Single-borrow caller only. Cache the first node derived from the real
+ * initial table so later valid active-list imports cannot change its owner.
+ * access_end clears it before a newly allocated firmware node can use table.
+ */
+u32 qdx_diag_fq_table_node(struct qdx_dma *region, u32 derived)
+{
+ if (!region->diag_fq_node && derived)
+  region->diag_fq_node = derived;
+ return region->diag_fq_node;
+}
+
+/* Caller holds the validated single borrow; no unregistered dereference. */
+bool qdx_diag_fq_table_physical(struct qdx_dma *region)
+{
+ return region->service->kind == QDX_SERVICE_SHAPER;
+}
+
+/* Caller holds the actual single registered borrow. This host exposure
+ * witness is invalidated on CONFIG exposure renewal or access_end. The pinned
+ * diagnostic serializes every firmware FREE/UNASSIGN until timer join.
+ * It is not a fabricated monotonically increasing firmware generation.
+ */
+bool qdx_diag_fq_table_bf(struct qdx_dma *region, const u32 key[7], bool record)
+{
+ if (!region->exposed || region->release_pending || !region->diag_exposure ||
+     !region->diag_fq_node || key[0] != region->diag_fq_node)
+  return false;
+ if (record && !region->diag_bf_pinned) {
+  memcpy(region->diag_bf_key, key, sizeof(region->diag_bf_key));
+  region->diag_bf_exposure = region->diag_exposure;
+  region->diag_bf_pinned = true;
+ }
+ return region->diag_bf_pinned && region->diag_bf_exposure == region->diag_exposure &&
+  !memcmp(region->diag_bf_key, key, sizeof(region->diag_bf_key));
+}

@@ -362,6 +362,7 @@ struct qdx_tc_owner {
 };
 
 extern bool qdx_tc_exit_draining;
+int qdx_tc_diag_bf_identity(struct qdx_tc_owner *owner, bool held, char *buffer);
 
 bool qdx_tc_owner_get(void *object);
 void qdx_tc_owner_put(void *object);

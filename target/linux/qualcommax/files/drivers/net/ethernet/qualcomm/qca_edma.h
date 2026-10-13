@@ -84,6 +84,7 @@
 
 #define EDMA_TX_INT_MASK 0x3
 #define EDMA_TX_MOD_TIMER 150
+#define EDMA_TX_MOD_TIMER_MASK 0xffff
 
 /* RX fill ring registers */
 #define EDMA_REG_RXFILL_BA(n) (0x29000 + (0x1000 * (n)))
@@ -244,12 +245,20 @@ struct edma_ring {
 	u16 count;
 	struct edma_tx_slot *tx;
 	struct page **page_store;
+	/* Isolated host index shadow; owning NAPI or joined setup only. */
+	u32 diag_owned_index;
+	bool diag_owned_valid;
 };
 
 struct edma_tx_slot {
 	struct sk_buff *skb;
+	/* Isolated raw-page TX owner; never aliases skb. */
+	struct page *page;
+	struct page_pool *pool;
+	u32 sync_len;
 	dma_addr_t dma;
 	u32 mapped;
+	bool pool_mapped; /* skb remains the sole owner of its original pool page. */
 	u32 bytes;
 	struct netdev_queue *queue;
 };
@@ -274,8 +283,77 @@ struct edma_tx_wait {
 	bool tagged;
 };
 
+enum edma_diag_stage {
+	EDMA_TIME_RX_SYNC_TAKE,
+	EDMA_TIME_RX_DISPATCH,
+	EDMA_TIME_RX_FILL,
+	EDMA_TIME_DDR_DECISION,
+	EDMA_TIME_DDR_OUTPUT,
+	EDMA_TIME_TX_COMPLETE,
+	EDMA_TIME_DDR_RECYCLE,
+	EDMA_TIME_COUNT,
+};
+
+struct edma_diag_time {
+	u64 calls, samples, units, sampled_units, total_ns, max_ns;
+};
+
+/* Resource-only observer. No queue policy or page-pool core changes. */
+enum edma_resource_owner {
+	EDMA_RESOURCE_COMPACT, EDMA_RESOURCE_TX, EDMA_RESOURCE_COMPLETION,
+	EDMA_RESOURCE_TOTAL, EDMA_RESOURCE_NONE,
+};
+struct edma_resource_amount {
+	u64 objects, raw_page_bytes, mapped_skb_page_bytes, skb_charge_bytes;
+	u64 known_page_bytes;
+};
+struct edma_resource_pool {
+	u64 read_start_ns, read_end_ns, generation;
+	u32 hold, release_before, release_after, order;
+	bool present;
+};
+struct edma_resource_data {
+	bool active;
+	u64 epoch, begin_ns, end_ns, errors, begin_errors, pool_generation;
+	struct edma_resource_amount live[EDMA_RESOURCE_NONE];
+	struct edma_resource_amount seed[EDMA_RESOURCE_NONE];
+	struct edma_resource_amount peak[EDMA_RESOURCE_NONE];
+	struct edma_resource_amount ended[EDMA_RESOURCE_NONE];
+	struct edma_resource_pool pool_begin, pool_end;
+};
+struct edma_resource_observer {
+	spinlock_t lock;
+	struct edma_resource_data data;
+};
+
 struct edma_priv {
+	struct edma_resource_observer resource_observer;
 	struct qdx_edma *qdx;
+	struct edma_ddr_diag *ddr_diag; /* Isolated RAM diagnostic only. */
+	struct edma_diag_time diag_time[EDMA_TIME_COUNT];
+	atomic64_t diag_raw_published, diag_raw_completed, diag_raw_aborted;
+	atomic64_t diag_raw_busy, diag_raw_error;
+	atomic64_t diag_native_tx_busy, diag_native_tx_drop;
+	atomic64_t diag_native_ring_stops, diag_tx_irq_handled;
+	u64 diag_tx_clean_calls, diag_tx_clean_zero, diag_tx_clean_entries;
+	u32 diag_tx_clean_max; /* TX NAPI writer; reset joins it. */
+	u32 diag_tx_mod_timer; /* Verified raw field, not a time unit. */
+	int diag_tx_mod_error, diag_tx_mod_restore_error;
+	u32 diag_tx_ring_highwater; /* tx_lock; hardware descriptor occupancy. */
+	atomic_t diag_raw_inflight;
+	atomic_t diag_pool_inflight;
+	atomic64_t diag_pool_published, diag_pool_completed, diag_pool_aborted;
+	atomic64_t diag_pool_fallback, diag_pool_error;
+	bool diag_raw_waiting; /* completion_lock; no page pointer. */
+	/* Isolated cost experiment; TX cache is owned by tx_lock. */
+	bool diag_tx_credit_valid, diag_rx_refill_needed;
+	u32 diag_tx_prod, diag_tx_cons;
+	/* Isolated event-owner axis, changed only with both NAPI joined. */
+	bool diag_single_napi;
+	atomic_t diag_poll_pending;
+	u64 diag_poll_calls, diag_poll_rx, diag_poll_tx, diag_poll_fill;
+	u64 diag_poll_service_only, diag_poll_no_rx, diag_poll_direct;
+	u64 diag_poll_errors;
 	bool napi_active;
 	bool native_ready;
 	bool shared;
